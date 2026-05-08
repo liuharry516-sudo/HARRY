@@ -4,7 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
 import time
-from streamlit_gsheetsconnect import GSheetsConnection
+from st_gsheets_connection import GSheetsConnection
 
 # --- 1. 系統初始化 ---
 st.set_page_config(page_title="Harry 專業交易系統", layout="wide")
