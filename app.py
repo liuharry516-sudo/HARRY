@@ -18,8 +18,22 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-if "login_state" not in st.session_state: st.session_state.login_state = False
-if "user_db" not in st.session_state: st.session_state.user_db = {"harry": {"pwd": "123", "role": "admin"}}
+# 1. 登入狀態初始化
+if "login_state" not in st.session_state: 
+    st.session_state.login_state = False
+
+# 2. 從 Secrets 讀取帳號密碼 (隱藏帳號關鍵處)
+if "user_db" not in st.session_state:
+    try:
+        # 從 Streamlit 後台抓取 user_db 內容
+        raw_users = st.secrets["user_db"]
+        # 轉換格式，讓程式可以使用
+        st.session_state.user_db = {u: {"pwd": str(p), "role": "admin"} for u, p in raw_users.items()}
+    except:
+        # 如果後台沒設定好，給一個預設值防止程式當掉
+        st.session_state.user_db = {"admin": {"pwd": "password", "role": "admin"}}
+
+# 3. 其他資料初始化
 if "watchlist" not in st.session_state: st.session_state.watchlist = []
 if "recommendations" not in st.session_state: st.session_state.recommendations = {}
 if "page" not in st.session_state: st.session_state.page = "HOME"
