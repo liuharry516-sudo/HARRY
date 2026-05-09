@@ -1110,7 +1110,7 @@ def main():
 
     # 側邊欄登入
     with st.sidebar:
-        st.title("TITAN V13 FIXED")
+        st.title("Harrry系統")
         if not st.session_state.logged:
             st.subheader("🔐 系統認證")
             u = st.text_input("帳號")
@@ -1193,14 +1193,19 @@ def main():
             with st.spinner(f"正在繪製 {target} 的圖表..."):
                 hist = yf.Ticker(target).history(period="1y")
                 if not hist.empty:
-                    df = HarryEngine.get_indicators(hist)
-                    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.02)
-                    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], 
-                                                low=df['Low'], close=df['Close'], name="K棒"), row=1, col=1)
-                    fig.add_trace(go.Bar(x=df.index, y=df['MACD_HIST'], name="MACD"), row=2, col=1)
-                    fig.add_trace(go.Scatter(x=df.index, y=df['BIAS_25'], name="25日乖離"), row=3, col=1)
-                    fig.update_layout(height=900, template="plotly_dark", xaxis_rangeslider_visible=False)
-                    st.plotly_chart(fig, use_container_width=True)
+                    # 移除 OHLC 任一為空的列，避免空資料導致 K 棒繪製失真
+                    hist_clean = hist.dropna(subset=['Open', 'High', 'Low', 'Close'])
+                    if hist_clean.empty:
+                        st.warning("歷史資料無有效 OHLC 資料，無法繪製 K 棒")
+                    else:
+                        df = HarryEngine.get_indicators(hist_clean)
+                        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.02)
+                        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], 
+                                                    low=df['Low'], close=df['Close'], name="K棒"), row=1, col=1)
+                        fig.add_trace(go.Bar(x=df.index, y=df['MACD_HIST'], name="MACD"), row=2, col=1)
+                        fig.add_trace(go.Scatter(x=df.index, y=df['BIAS_25'], name="25日乖離"), row=3, col=1)
+                        fig.update_layout(height=900, template="plotly_dark", xaxis_rangeslider_visible=False)
+                        st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.warning("無法取得歷史資料")
         except Exception as e:
