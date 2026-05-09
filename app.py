@@ -1774,33 +1774,33 @@ def render_financial_wall(symbol):
             except Exception:
                 vol_display = str(q_vol)
 
-                price_display = (f'{q_price:,.2f}' if q_price is not None else 'N/A')
-                # 計算百分比變動
-                q_pct = None
-                try:
-                        if q_price is not None and q_prev is not None and q_prev != 0:
-                                q_pct = (q_price - q_prev) / q_prev * 100.0
-                except Exception:
-                        q_pct = None
+        price_display = (f'{q_price:,.2f}' if q_price is not None else 'N/A')
+        # 計算百分比變動
+        q_pct = None
+        try:
+            if q_price is not None and q_prev is not None and q_prev != 0:
+                q_pct = (q_price - q_prev) / q_prev * 100.0
+        except Exception:
+            q_pct = None
 
-                pct_display = ''
-                if q_pct is not None:
-                        pct_color = '#ef4444' if q_pct > 0 else ('#10b981' if q_pct < 0 else '#d1d5db')
-                        sign = '+' if q_pct > 0 else ('' if q_pct == 0 else '')
-                        pct_display = f"<div style='font-size:16px;font-weight:600;color:{pct_color};margin-left:8px'>{sign}{q_pct:.2f}%</div>"
+        pct_display = ''
+        if q_pct is not None:
+            pct_color = '#ef4444' if q_pct > 0 else ('#10b981' if q_pct < 0 else '#d1d5db')
+            sign = '+' if q_pct > 0 else ('' if q_pct == 0 else '')
+            pct_display = f"<div style='font-size:16px;font-weight:600;color:{pct_color};margin-left:8px'>{sign}{q_pct:.2f}%</div>"
 
-                price_html = f"""
-                <div style='display:flex;align-items:center;gap:12px'>
-                    <div style='display:flex;align-items:center'>
-                        <div style='font-size:34px;font-weight:700;padding:8px 14px;border-radius:8px;background:{bg};color:{txt_color};min-width:160px;text-align:center;'>{price_display}</div>
-                        {pct_display}
-                    </div>
-                    <div style='color:#d1d5db'>
-                        <div style='font-size:14px'>高: {(f'{q_high:,.2f}' if q_high is not None else 'N/A')} &ensp; 開: {(f'{q_open:,.2f}' if q_open is not None else 'N/A')} &ensp; 低: {(f'{q_low:,.2f}' if q_low is not None else 'N/A')} &ensp; 收: {(f'{q_close:,.2f}' if q_close is not None else 'N/A')}</div>
-                        <div style='font-size:13px;margin-top:6px'>成交: {vol_display} &ensp; 變動: {(f'{q_change:.2f}' if q_change is not None else 'N/A')}</div>
-                    </div>
-                </div>
-                """
+        price_html = f"""
+        <div style='display:flex;align-items:center;gap:12px'>
+          <div style='display:flex;align-items:center'>
+            <div style='font-size:34px;font-weight:700;padding:8px 14px;border-radius:8px;background:{bg};color:{txt_color};min-width:160px;text-align:center;'>{price_display}</div>
+            {pct_display}
+          </div>
+          <div style='color:#d1d5db'>
+            <div style='font-size:14px'>高: {(f'{q_high:,.2f}' if q_high is not None else 'N/A')} &ensp; 開: {(f'{q_open:,.2f}' if q_open is not None else 'N/A')} &ensp; 低: {(f'{q_low:,.2f}' if q_low is not None else 'N/A')} &ensp; 收: {(f'{q_close:,.2f}' if q_close is not None else 'N/A')}</div>
+            <div style='font-size:13px;margin-top:6px'>成交: {vol_display} &ensp; 變動: {(f'{q_change:.2f}' if q_change is not None else 'N/A')}</div>
+          </div>
+        </div>
+        """
         st.markdown(price_html, unsafe_allow_html=True)
 
     with c_b:
