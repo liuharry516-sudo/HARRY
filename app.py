@@ -13,6 +13,8 @@ import uuid
 import socket
 from io import StringIO
 from zoneinfo import ZoneInfo
+from decimal import Decimal, ROUND_HALF_UP
+import sqlite3
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -114,6 +116,7 @@ class ManagerTransaction(Base):
     symbol = Column(String(50))
     shares = Column(Float)
     price = Column(Float)
+    realized = Column(Float, default=0.0)
     created_at = Column(DateTime, default=datetime.datetime.now)
 
 class PortfolioMeta(Base):
@@ -161,6 +164,26 @@ class InviteToken(Base):
     assigned_user = Column(String(100), nullable=True)
 
 Base.metadata.create_all(engine)
+
+# 確保新版欄位存在（sqlite ALTER TABLE 加欄位）
+def _ensure_db_migrations():
+    try:
+        conn = sqlite3.connect(DB_ABS_PATH)
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info('manager_transactions')")
+        cols = [r[1] for r in cur.fetchall()]
+        if 'realized' not in cols:
+            try:
+                cur.execute("ALTER TABLE manager_transactions ADD COLUMN realized FLOAT DEFAULT 0.0")
+                conn.commit()
+                logger.info('Added realized column to manager_transactions')
+            except Exception as e:
+                logger.warning(f'Failed to add realized column: {e}')
+        conn.close()
+    except Exception as e:
+        logger.warning(f'DB migration check failed: {e}')
+
+_ensure_db_migrations()
 
 # ==============================================================================
 # [BUGFIX] 改進的時區與市場狀態檢查
@@ -696,7 +719,7 @@ def process_buy(actor: str, symbol: str, shares: float, price: float = None):
         else:
             db.add(ManagerHolding(symbol=symbol, shares=shares, avg_price=price))
         
-        db.add(ManagerTransaction(actor=actor, action='buy', symbol=symbol, shares=shares, price=price))
+        db.add(ManagerTransaction(actor=actor, action='buy', symbol=symbol, shares=shares, price=price, realized=0.0))
         db.add(AuditLog(actor=actor, action='manager_buy', target=f"{symbol}:{shares}@{price}"))
         db.commit()
         db.close()
@@ -730,7 +753,13 @@ def process_sell(actor: str, symbol: str, shares: float, price: float = None):
         if h.shares <= 0:
             h.active = False
         
-        db.add(ManagerTransaction(actor=actor, action='sell', symbol=symbol, shares=shares, price=price))
+        # 計算已實現損益（以現有平均成本為基準）
+        realized_profit = 0.0
+        try:
+            realized_profit = (price - (h.avg_price or 0.0)) * (shares or 0.0)
+        except Exception:
+            realized_profit = 0.0
+        db.add(ManagerTransaction(actor=actor, action='sell', symbol=symbol, shares=shares, price=price, realized=realized_profit))
         db.add(AuditLog(actor=actor, action='manager_sell', target=f"{symbol}:{shares}@{price}"))
         db.commit()
         db.close()
@@ -907,29 +936,52 @@ def get_latest_quote_info(symbol: str):
             price = i.get('currentPrice') or i.get('regularMarketPrice') or None
             prev = i.get('previousClose') or i.get('regularMarketPreviousClose')
             vol = i.get('volume') or None
-            if price is None:
-                # 用歷史資料補
-                h = tk.history(period='2d')
-                if h is not None and not h.empty and 'Close' in h.columns:
-                    price = float(h['Close'].iloc[-1])
-                    if len(h) > 1:
-                        prev = float(h['Close'].iloc[-2])
-                if h is not None and 'Volume' in h.columns:
-                    vol = int(h['Volume'].iloc[-1])
+            openp = i.get('open') or None
+            high = i.get('dayHigh') or None
+            low = i.get('dayLow') or None
+            closep = i.get('previousClose') or None
+            # 若 info 不完整，用歷史資料補足
+            h = None
+            try:
+                h = tk.history(period='5d')
+            except Exception:
+                h = None
+            if (price is None or openp is None or high is None or low is None) and h is not None and not h.empty:
+                hclean = h.dropna(subset=['Open', 'High', 'Low', 'Close'])
+                if not hclean.empty:
+                    last = hclean.iloc[-1]
+                    price = price or float(last['Close'])
+                    prev = prev or (float(hclean['Close'].iloc[-2]) if len(hclean) > 1 else None)
+                    vol = vol or (int(last['Volume']) if 'Volume' in last and not pd.isna(last['Volume']) else None)
+                    openp = openp or float(last['Open'])
+                    high = high or float(last['High'])
+                    low = low or float(last['Low'])
+                    closep = closep or float(last['Close'])
 
             info['price'] = float(price) if price is not None else None
             info['prev_close'] = float(prev) if prev is not None else None
             info['change'] = (info['price'] - info['prev_close']) if (info['price'] is not None and info['prev_close'] is not None) else None
             info['volume'] = int(vol) if vol is not None else None
+            info['open'] = float(openp) if openp is not None else None
+            info['high'] = float(high) if high is not None else None
+            info['low'] = float(low) if low is not None else None
+            info['close'] = float(closep) if closep is not None else None
             return info
         except Exception:
             # 最後再嘗試用歷史資料
             h = tk.history(period='5d')
             if h is not None and not h.empty:
-                price = float(h['Close'].iloc[-1])
-                prev = float(h['Close'].iloc[-2]) if len(h) > 1 else None
-                vol = int(h['Volume'].iloc[-1]) if 'Volume' in h.columns else None
-                return {'price': price, 'prev_close': prev, 'change': (price - prev) if prev else None, 'volume': vol}
+                hclean = h.dropna(subset=['Open', 'High', 'Low', 'Close'])
+                if not hclean.empty:
+                    last = hclean.iloc[-1]
+                    price = float(last['Close'])
+                    prev = float(hclean['Close'].iloc[-2]) if len(hclean) > 1 else None
+                    vol = int(last['Volume']) if 'Volume' in last and not pd.isna(last['Volume']) else None
+                    openp = float(last['Open'])
+                    high = float(last['High'])
+                    low = float(last['Low'])
+                    closep = float(last['Close'])
+                    return {'price': price, 'prev_close': prev, 'change': (price - prev) if prev else None, 'volume': vol, 'open': openp, 'high': high, 'low': low, 'close': closep}
     except Exception:
         pass
     return {'price': None, 'prev_close': None, 'change': None, 'volume': None}
@@ -952,6 +1004,16 @@ def compute_rsi(series: pd.Series, period=14):
     rs = ma_up / (ma_down.replace({0: np.nan}))
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(0)
+
+def round_half_up(n, ndigits=2):
+    """四捨五入（四捨五入，非銀行家舍入）"""
+    if n is None:
+        return None
+    exp = Decimal('1e{}'.format(-ndigits))
+    try:
+        return float(Decimal(str(n)).quantize(exp, rounding=ROUND_HALF_UP))
+    except Exception:
+        return float(Decimal(n).quantize(exp, rounding=ROUND_HALF_UP))
 
 def try_fetch_three_major_flow(symbol: str, days: int = 10):
     """嘗試用 `twstock` 或其他方法擷取三大法人近 N 日買賣超，若無法取得回傳空 DataFrame 與說明訊息。"""
@@ -1178,22 +1240,85 @@ def render_financial_wall(symbol):
 
     c_a, c_b = st.columns([1, 2])
     with c_a:
-        st.metric("即時價格", f"{price if price is not None else 'N/A'}", 
-                 delta=f"{change:.2f}" if change is not None else None)
-    with c_b:
-        if change is None:
-            render_status_light("價格未知", color="#6b7280")
-        else:
-            color = "#10b981" if change >= 0 else "#ef4444"
-            render_status_light("漲" if change >= 0 else "跌", color=color, blink=is_market_open())
+        # 自訂即時價格區塊（大字體）並顯示最新高開低收與成交量
+        quote = get_latest_quote_info(symbol)
+        q_price = quote.get('price')
+        q_prev = quote.get('prev_close')
+        q_change = quote.get('change')
+        q_open = quote.get('open')
+        q_high = quote.get('high')
+        q_low = quote.get('low')
+        q_close = quote.get('close')
+        q_vol = quote.get('volume')
 
-    # 即時走勢（分時或最近日線），若今天是假日會使用最近可得的資料
+        lower = None
+        upper = None
+        if q_prev:
+            lower = round_half_up(q_prev * 0.9, 2)
+            upper = round_half_up(q_prev * 1.1, 2)
+
+        limit_up = False
+        limit_down = False
+        if q_price is not None and upper is not None:
+            if round_half_up(q_price, 2) >= upper:
+                limit_up = True
+            if round_half_up(q_price, 2) <= lower:
+                limit_down = True
+
+        bg = 'transparent'
+        if limit_up:
+            bg = '#ef4444'
+        elif limit_down:
+            bg = '#10b981'
+
+        vol_display = 'N/A'
+        if q_vol:
+            try:
+                vol_zhang = int(q_vol / 1000)
+                vol_display = f"{vol_zhang:,} 張"
+            except Exception:
+                vol_display = str(q_vol)
+
+        price_html = f"""
+        <div style='display:flex;align-items:center;gap:12px'>
+          <div style='font-size:34px;font-weight:700;padding:8px 14px;border-radius:8px;background:{bg};color:#ffffff;min-width:160px;text-align:center;'>{(f'{q_price:,.2f}' if q_price is not None else 'N/A')}</div>
+          <div style='color:#d1d5db'>
+            <div style='font-size:14px'>高: {(f'{q_high:,.2f}' if q_high is not None else 'N/A')} &ensp; 開: {(f'{q_open:,.2f}' if q_open is not None else 'N/A')} &ensp; 低: {(f'{q_low:,.2f}' if q_low is not None else 'N/A')} &ensp; 收: {(f'{q_close:,.2f}' if q_close is not None else 'N/A')}</div>
+            <div style='font-size:13px;margin-top:6px'>成交: {vol_display} &ensp; 變動: {(f'{q_change:.2f}' if q_change is not None else 'N/A')}</div>
+          </div>
+        </div>
+        """
+        st.markdown(price_html, unsafe_allow_html=True)
+
+    with c_b:
+        if q_change is None:
+            render_status_light("價格未知", color="#6b7280", blink=True)
+        else:
+            # 仍用漲跌顯示燈號（顏色表示漲/跌），但漲停/跌停改以背景顯示在價格區塊
+            color = "#10b981" if q_change >= 0 else "#ef4444"
+            render_status_light("漲" if q_change >= 0 else "跌", color=color, blink=is_market_open())
+
+    # 即時走勢（分時或最近日線），若今天是假日則使用最近可得的資料；Y 軸顯示前一收盤上下 10%
     try:
         trend = get_price_trend_series(symbol)
         if not trend.empty:
-            # 限制顯示長度
             tshow = trend.tail(240)
-            st.line_chart(tshow)
+            # 計算 y 範圍
+            if q_prev:
+                y_min = round_half_up(q_prev * 0.9, 2)
+                y_max = round_half_up(q_prev * 1.1, 2)
+            else:
+                y_min = float(tshow.min() * 0.98)
+                y_max = float(tshow.max() * 1.02)
+
+            fig_trend = go.Figure()
+            fig_trend.add_trace(go.Scatter(x=tshow.index, y=tshow.values, mode='lines', line=dict(color='#60a5fa')))
+            fig_trend.update_layout(template='plotly_dark', height=240)
+            try:
+                fig_trend.update_yaxes(range=[y_min, y_max])
+            except Exception:
+                pass
+            st.plotly_chart(fig_trend, use_container_width=True)
     except Exception:
         pass
 
@@ -1527,8 +1652,17 @@ def main():
                 if hist is None or hist.empty:
                     st.warning("無法取得歷史資料")
                 else:
-                    # 移除 OHLC 任一為空的列
+                    # 移除 OHLC 任一為空或為 0 的列，並排除週末（保險）
                     hist_clean = hist.dropna(subset=['Open', 'High', 'Low', 'Close'])
+                    try:
+                        hist_clean = hist_clean[(hist_clean['Open'] != 0) & (hist_clean['High'] != 0) & (hist_clean['Low'] != 0) & (hist_clean['Close'] != 0)]
+                    except Exception:
+                        pass
+                    try:
+                        # 移除 index 為週末的資料（若存在）
+                        hist_clean = hist_clean[~hist_clean.index.to_series().dt.weekday.isin([5,6])]
+                    except Exception:
+                        pass
                     if hist_clean.empty:
                         st.warning("歷史資料無有效 OHLC 資料，無法繪製 K 棒")
                     else:
@@ -1710,7 +1844,21 @@ def main():
             df_snaps = pd.DataFrame([{"time": s.created_at, "value": s.value} for s in snaps])
             df_snaps['time'] = pd.to_datetime(df_snaps['time'])
             df_snaps = df_snaps.set_index('time')
-            st.line_chart(df_snaps['value'])
+            # 使用 plotly 自訂 y 軸範圍：預設為初始資金上下50%，若有變動則以實際值為準
+            initial = metrics.get('initial', 0.0) or 0.0
+            min_v = float(df_snaps['value'].min())
+            max_v = float(df_snaps['value'].max())
+            if min_v == max_v == initial:
+                y0 = initial * 0.5
+                y1 = initial * 1.5
+            else:
+                y0 = min_v * 0.98
+                y1 = max_v * 1.02
+
+            fig_val = go.Figure()
+            fig_val.add_trace(go.Scatter(x=df_snaps.index, y=df_snaps['value'], mode='lines+markers', name='資產淨值'))
+            fig_val.update_layout(template='plotly_dark', height=360, yaxis=dict(range=[y0, y1]))
+            st.plotly_chart(fig_val, use_container_width=True)
         else:
             st.info("尚無歷史快照")
 
@@ -1720,7 +1868,7 @@ def main():
         txs = db.query(ManagerTransaction).order_by(ManagerTransaction.created_at.desc()).limit(50).all()
         db.close()
         if txs:
-            df_txs = pd.DataFrame([{"時間": t.created_at, "操作者": t.actor, "動作": t.action, "代碼": t.symbol, "股數": t.shares, "價格": t.price} for t in txs])
+            df_txs = pd.DataFrame([{"時間": t.created_at, "操作者": t.actor, "動作": t.action, "代碼": t.symbol, "股數": t.shares, "價格": t.price, "獲利": getattr(t, 'realized', 0.0)} for t in txs])
             df_txs['時間'] = pd.to_datetime(df_txs['時間'])
             st.dataframe(df_txs)
         else:
