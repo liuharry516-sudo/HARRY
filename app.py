@@ -699,7 +699,12 @@ def record_snapshot():
 def process_buy(actor: str, symbol: str, shares: float, price: float = None):
     db = get_db()
     try:
-        p = init_portfolio() or PortfolioMeta()
+        # 使用同一個 session 取得/建立 PortfolioMeta，避免不同 session 導致更新無法寫回 DB
+        p = db.query(PortfolioMeta).first()
+        if not p:
+            p = PortfolioMeta(initial_capital=10000.0, cash=10000.0)
+            db.add(p)
+            db.commit()
         if price is None:
             price = get_latest_price(symbol) or 0.0
         
@@ -736,7 +741,12 @@ def process_buy(actor: str, symbol: str, shares: float, price: float = None):
 def process_sell(actor: str, symbol: str, shares: float, price: float = None):
     db = get_db()
     try:
-        p = init_portfolio() or PortfolioMeta()
+        # 使用同一個 session 取得/建立 PortfolioMeta
+        p = db.query(PortfolioMeta).first()
+        if not p:
+            p = PortfolioMeta(initial_capital=10000.0, cash=10000.0)
+            db.add(p)
+            db.commit()
         if price is None:
             price = get_latest_price(symbol) or 0.0
         
@@ -1115,8 +1125,23 @@ def try_fetch_three_major_flow(symbol: str, days: int = 10):
     """嘗試從 Yahoo（台股頁面或 finance.yahoo.com）抓三大法人買賣超表格。
     回傳 (DataFrame, message)。若無法取得則回傳空 DataFrame 與原因說明。
     """
-    code = symbol.replace('.TW', '').replace('.T', '')
-    urls = [f"https://tw.stock.yahoo.com/quote/{code}", f"https://finance.yahoo.com/quote/{symbol}/holders", f"https://finance.yahoo.com/quote/{symbol}"]
+    # 建立候選 symbol（支援 .TW / .TWO / bare number）
+    s = symbol.upper()
+    base = s.split('.')[0]
+    candidates = []
+    if s.endswith('.TW'):
+        candidates = [s, base + '.TWO']
+    elif s.endswith('.TWO'):
+        candidates = [s, base + '.TW']
+    elif base.isdigit():
+        candidates = [base + '.TW', base + '.TWO', base]
+    else:
+        candidates = [s]
+
+    urls = []
+    for cand in candidates:
+        code = cand.replace('.TW', '').replace('.T', '')
+        urls.extend([f"https://tw.stock.yahoo.com/quote/{code}", f"https://finance.yahoo.com/quote/{cand}/holders", f"https://finance.yahoo.com/quote/{cand}"])
     try:
         import requests
     except Exception:
@@ -1148,19 +1173,44 @@ def fetch_financials_via_web(symbol: str):
         results['errors'].append('requests 未安裝，無法抓取網頁')
         return results
 
-    base = f"https://finance.yahoo.com/quote/{symbol}"
-    pages = {'financials': base + '/financials', 'balance': base + '/balance-sheet', 'cashflow': base + '/cash-flow'}
+    # 支援 .TW / .TWO / bare number 的候選 symbol
+    s = symbol.upper()
+    base = s.split('.')[0]
+    candidates = []
+    if s.endswith('.TW'):
+        candidates = [s, base + '.TWO']
+    elif s.endswith('.TWO'):
+        candidates = [s, base + '.TW']
+    elif base.isdigit():
+        candidates = [base + '.TW', base + '.TWO', base]
+    else:
+        candidates = [s]
+
     headers = {'User-Agent': 'Mozilla/5.0'}
-    for k, url in pages.items():
-        try:
-            r = requests.get(url, timeout=10, headers=headers)
-            r.raise_for_status()
-            tables = pd.read_html(r.text)
-            if tables and len(tables) > 0:
-                # 往往第一張表是有用的，取第一個可解析表格
-                results[k] = tables[0]
-        except Exception as e:
-            results['errors'].append(f"{k} 取得失敗: {e}")
+    import re
+    for cand in candidates:
+        base_url = f"https://finance.yahoo.com/quote/{cand}"
+        pages = {'financials': base_url + '/financials', 'balance': base_url + '/balance-sheet', 'cashflow': base_url + '/cash-flow'}
+        for k, url in pages.items():
+            try:
+                r = requests.get(url, timeout=10, headers=headers)
+                r.raise_for_status()
+                tables = pd.read_html(r.text)
+                if tables and len(tables) > 0:
+                    results[k] = tables[0]
+                    # 嘗試從頁面擷取公司中文/英文字樣
+                    if 'company_name' not in results or not results.get('company_name'):
+                        m = re.search(r'<h1[^>]*>(.*?)</h1>', r.text, re.S | re.I)
+                        if m:
+                            title = re.sub(r'<.*?>', '', m.group(1)).strip()
+                            if title:
+                                results['company_name'] = title
+            except Exception as e:
+                results['errors'].append(f"{k} 取得失敗 ({cand}): {e}")
+
+        # 若已抓到任一表格，停止再嘗試其他候選（以第一個成功者為主）
+        if not results['financials'].empty or not results['balance'].empty or not results['cashflow'].empty:
+            break
 
     return results
 
@@ -1186,10 +1236,14 @@ def compute_portfolio_metrics():
         except Exception:
             realized = 0.0
 
-        # 總損益 = 已實現 + 未實現
-        total_pnl = realized + unrealized
+        # 總損益：直接用目前資產淨值扣除初始資金（確保是以扣除成本後計算）
+        try:
+            total_pnl = float(current_value - initial)
+        except Exception:
+            total_pnl = realized + unrealized
 
-        total_return_pct = (total_pnl / initial * 100.0) if initial else 0.0
+        # 報酬率（以初始資金為基準）
+        total_return_pct = ((current_value - initial) / initial * 100.0) if initial else 0.0
 
         db.close()
         return {
@@ -1308,7 +1362,59 @@ def render_financial_wall(symbol):
     else:
         logger.info(f"Fetching fresh data for {symbol}")
         with st.spinner(f"正在取得 {symbol} 的資料..."):
-            info, financials, balance, cashflow, inst, major = safe_ticker_fetch(symbol, retries=2, backoff=1.0)
+            # 生成候選 symbol（支援 .TW / .TWO / bare number）
+            s = symbol.upper()
+            base = s.split('.')[0]
+            candidates = []
+            if s.endswith('.TW'):
+                candidates = [s, base + '.TWO']
+            elif s.endswith('.TWO'):
+                candidates = [s, base + '.TW']
+            elif base.isdigit():
+                candidates = [base + '.TW', base + '.TWO', base]
+            else:
+                candidates = [s]
+
+            info = {}
+            financials = pd.DataFrame()
+            balance = pd.DataFrame()
+            cashflow = pd.DataFrame()
+            inst = pd.DataFrame()
+            major = pd.DataFrame()
+
+            # 依序嘗試候選 symbol，第一個成功者即停止
+            for cand in candidates:
+                try:
+                    info_tmp, financials_tmp, balance_tmp, cashflow_tmp, inst_tmp, major_tmp = safe_ticker_fetch(cand, retries=2, backoff=1.0)
+                    ok = bool(info_tmp and any(k in info_tmp for k in ('shortName', 'longName', 'currentPrice', 'regularMarketPrice'))) or (not financials_tmp.empty) or (not balance_tmp.empty) or (not cashflow_tmp.empty)
+                    if ok:
+                        info, financials, balance, cashflow, inst, major = info_tmp, financials_tmp, balance_tmp, cashflow_tmp, inst_tmp, major_tmp
+                        symbol = cand
+                        break
+                except Exception:
+                    continue
+
+            # 若 yfinance 沒抓到完整財報，再嘗試網頁抓取（Yahoo）
+            if (not info or (financials.empty and balance.empty and cashflow.empty)):
+                for cand in candidates:
+                    try:
+                        res = fetch_financials_via_web(cand)
+                        if not res.get('financials', pd.DataFrame()).empty:
+                            financials = res['financials']
+                        if not res.get('balance', pd.DataFrame()).empty:
+                            balance = res['balance']
+                        if not res.get('cashflow', pd.DataFrame()).empty:
+                            cashflow = res['cashflow']
+                        # 若網頁取得到公司名稱，補回 info
+                        if res.get('company_name') and (not info or not info.get('shortName')):
+                            info = info or {}
+                            info['shortName'] = res.get('company_name')
+                        # 若有任何表格則視為成功並停止
+                        if (not financials.empty) or (not balance.empty) or (not cashflow.empty):
+                            symbol = cand
+                            break
+                    except Exception:
+                        continue
 
         # 寫入快取
         try:
@@ -1331,6 +1437,10 @@ def render_financial_wall(symbol):
     db.close()
 
     st.markdown("## 🏢 企業核心檔案與營運摘要")
+    # 顯示資料狀態燈（綠=正常、紅=異常），並閃爍提示
+    data_ok = bool(info and (info.get('currentPrice') or info.get('regularMarketPrice') or (not financials.empty)))
+    render_status_light("股市資料運行中" if data_ok else "資料缺失或錯誤", color=("#10b981" if data_ok else "#ef4444"), blink=True)
+
     company_name = info.get('shortName', info.get('longName', symbol))
     industry = info.get('industry', '未知')
     sector = info.get('sector', '未知')
