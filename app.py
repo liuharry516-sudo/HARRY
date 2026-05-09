@@ -821,6 +821,175 @@ def make_shareable_link(invite_token: str = None, port: int = None) -> str:
         return f"http://{host}:{port}/?invite={invite_token}"
     return f"http://{host}:{port}/"
 
+# ======================================================================
+# 翻譯快取與即時走勢、報價輔助函式
+# ======================================================================
+TRANSLATION_CACHE_FILE = os.path.join(BASE_STORAGE, "translation_cache.json")
+
+def load_translation_cache():
+    try:
+        if os.path.exists(TRANSLATION_CACHE_FILE):
+            with open(TRANSLATION_CACHE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_translation_cache(cache: dict):
+    try:
+        with open(TRANSLATION_CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def translate_to_zh(summary: str, symbol: str = None) -> str:
+    """嘗試將英文摘要翻譯為繁體中文，若無法翻譯則回傳原文。
+    使用 googletrans 套件（若可用），結果會快取到本地檔案以避免重複呼叫。
+    """
+    if not summary:
+        return ''
+    cache = load_translation_cache()
+    key = symbol or hashlib.sha256(summary.encode('utf-8')).hexdigest()
+    if key in cache:
+        return cache[key]
+
+    translated = summary
+    try:
+        # 延後 import，避免未安裝時造成啟動錯誤
+        from googletrans import Translator
+        tr = Translator()
+        res = tr.translate(summary, dest='zh-tw')
+        translated = res.text
+    except Exception:
+        # 無法使用 googletrans 或翻譯失敗，保留原文
+        translated = summary
+
+    try:
+        cache[key] = translated
+        save_translation_cache(cache)
+    except Exception:
+        pass
+
+    return translated
+
+def get_price_trend_series(symbol: str):
+    """回傳最近的價格序列（Series），優先使用近幾天的即時/分時資料，若無則回傳日線收盤價序列。"""
+    try:
+        tk = yf.Ticker(symbol)
+        # 優先嘗試分時（近 7 日，5 分），若無資料再使用日線
+        try:
+            intr = tk.history(period='7d', interval='5m')
+            if intr is not None and not intr.empty and 'Close' in intr.columns:
+                s = intr['Close'].dropna()
+                if not s.empty:
+                    return s
+        except Exception:
+            pass
+
+        # Fallback: 日線
+        try:
+            hist = tk.history(period='180d')
+            if hist is not None and not hist.empty and 'Close' in hist.columns:
+                return hist['Close'].dropna()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return pd.Series(dtype=float)
+
+def get_latest_quote_info(symbol: str):
+    """回傳最新報價摘要：price, prev_close, change, volume（volume 為原始成交股數）。"""
+    try:
+        tk = yf.Ticker(symbol)
+        info = {}
+        try:
+            i = tk.info or {}
+            price = i.get('currentPrice') or i.get('regularMarketPrice') or None
+            prev = i.get('previousClose') or i.get('regularMarketPreviousClose')
+            vol = i.get('volume') or None
+            if price is None:
+                # 用歷史資料補
+                h = tk.history(period='2d')
+                if h is not None and not h.empty and 'Close' in h.columns:
+                    price = float(h['Close'].iloc[-1])
+                    if len(h) > 1:
+                        prev = float(h['Close'].iloc[-2])
+                if h is not None and 'Volume' in h.columns:
+                    vol = int(h['Volume'].iloc[-1])
+
+            info['price'] = float(price) if price is not None else None
+            info['prev_close'] = float(prev) if prev is not None else None
+            info['change'] = (info['price'] - info['prev_close']) if (info['price'] is not None and info['prev_close'] is not None) else None
+            info['volume'] = int(vol) if vol is not None else None
+            return info
+        except Exception:
+            # 最後再嘗試用歷史資料
+            h = tk.history(period='5d')
+            if h is not None and not h.empty:
+                price = float(h['Close'].iloc[-1])
+                prev = float(h['Close'].iloc[-2]) if len(h) > 1 else None
+                vol = int(h['Volume'].iloc[-1]) if 'Volume' in h.columns else None
+                return {'price': price, 'prev_close': prev, 'change': (price - prev) if prev else None, 'volume': vol}
+    except Exception:
+        pass
+    return {'price': None, 'prev_close': None, 'change': None, 'volume': None}
+
+def compute_macd(series: pd.Series, short=12, long=26, signal=9):
+    ema_short = series.ewm(span=short, adjust=False).mean()
+    ema_long = series.ewm(span=long, adjust=False).mean()
+    macd_line = ema_short - ema_long
+    macd_signal = macd_line.ewm(span=signal, adjust=False).mean()
+    macd_hist = macd_line - macd_signal
+    return macd_line, macd_signal, macd_hist
+
+def compute_rsi(series: pd.Series, period=14):
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    # 使用 Wilder 平滑（EMA-like）
+    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
+    rs = ma_up / (ma_down.replace({0: np.nan}))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(0)
+
+def try_fetch_three_major_flow(symbol: str, days: int = 10):
+    """嘗試用 `twstock` 或其他方法擷取三大法人近 N 日買賣超，若無法取得回傳空 DataFrame 與說明訊息。"""
+    # 先嘗試 twstock（如已安裝）
+    try:
+        import twstock
+        code = symbol.replace('.TW', '').replace('.T', '')
+        # twstock 尚未提供直接的三大法人日買賣超 API 在本地端，回傳空表並提醒
+        return pd.DataFrame(), 'twstock 已安裝，但本程式需額外實作從 TWSE 或公開 API 取得三大法人資料'
+    except Exception:
+        return pd.DataFrame(), '請安裝 twstock 或允許後端網路抓取三大法人資料（需另行實作）'
+
+def fetch_financials_via_web(symbol: str):
+    """嘗試從 Yahoo Finance 網頁抓取財務報表表格（損益表、資產負債表、現金流量表）。
+    注意：Yahoo 使用動態載入，讀取可能失敗；此函式會嘗試用 pandas.read_html 解析。"""
+    results = {'financials': pd.DataFrame(), 'balance': pd.DataFrame(), 'cashflow': pd.DataFrame(), 'errors': []}
+    try:
+        import requests
+    except Exception:
+        results['errors'].append('requests 未安裝，無法抓取網頁')
+        return results
+
+    base = f"https://finance.yahoo.com/quote/{symbol}"
+    pages = {'financials': base + '/financials', 'balance': base + '/balance-sheet', 'cashflow': base + '/cash-flow'}
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    for k, url in pages.items():
+        try:
+            r = requests.get(url, timeout=10, headers=headers)
+            r.raise_for_status()
+            tables = pd.read_html(r.text)
+            if tables and len(tables) > 0:
+                # 往往第一張表是有用的，取第一個可解析表格
+                results[k] = tables[0]
+        except Exception as e:
+            results['errors'].append(f"{k} 取得失敗: {e}")
+
+    return results
+
 def compute_portfolio_metrics():
     db = get_db()
     try:
@@ -982,9 +1151,23 @@ def render_financial_wall(symbol):
     sector = info.get('sector', '未知')
     st.markdown(f"**{company_name}** — {industry} | {sector}")
     
-    summary = info.get('longBusinessSummary', '無資料')
-    if summary:
-        st.info(summary[:500] + "..." if len(summary) > 500 else summary)
+    summary_en = info.get('longBusinessSummary', '') or ''
+    if summary_en:
+        # 嘗試翻譯為繁體中文（若可用）
+        try:
+            summary_cn = translate_to_zh(summary_en, symbol)
+        except Exception:
+            summary_cn = summary_en
+
+        if summary_cn and summary_cn.strip() and summary_cn != summary_en:
+            st.info(summary_cn[:1000] + ("..." if len(summary_cn) > 1000 else ""))
+            with st.expander("顯示原文（English）"):
+                st.write(summary_en)
+        else:
+            st.info(summary_en[:1000] + ("..." if len(summary_en) > 1000 else ""))
+
+    else:
+        st.info('無公司簡介')
 
     # 價格與狀態
     price = get_latest_price(symbol)
@@ -1003,6 +1186,16 @@ def render_financial_wall(symbol):
         else:
             color = "#10b981" if change >= 0 else "#ef4444"
             render_status_light("漲" if change >= 0 else "跌", color=color, blink=is_market_open())
+
+    # 即時走勢（分時或最近日線），若今天是假日會使用最近可得的資料
+    try:
+        trend = get_price_trend_series(symbol)
+        if not trend.empty:
+            # 限制顯示長度
+            tshow = trend.tail(240)
+            st.line_chart(tshow)
+    except Exception:
+        pass
 
     # 自選股
     try:
@@ -1034,6 +1227,34 @@ def render_financial_wall(symbol):
             st.dataframe(financials, use_container_width=True, height=500)
         else:
             st.info("無財務報表資料")
+            if st.button("嘗試從網頁抓取損益表", key=f"scrape_fin_{symbol}"):
+                with st.spinner("正在從網頁抓取損益表..."):
+                    res = fetch_financials_via_web(symbol)
+                    if not res['financials'].empty:
+                        financials = res['financials']
+                        st.success("已抓到損益表（來自網頁）")
+                        st.dataframe(financials, use_container_width=True, height=500)
+                        # 嘗試寫入快取
+                        try:
+                            db = get_db()
+                            cache = db.query(FinancialCache).filter_by(symbol=symbol).first()
+                            if not cache:
+                                cache = FinancialCache(symbol=symbol)
+                                db.add(cache)
+                            cache.fetched_at = datetime.datetime.now()
+                            cache.financials_csv = financials.to_csv() if not financials.empty else ''
+                            db.commit()
+                            db.close()
+                        except Exception:
+                            try:
+                                db.rollback()
+                                db.close()
+                            except Exception:
+                                pass
+                    else:
+                        st.error("未能從網頁抓到損益表，查看錯誤訊息")
+                        for e in res.get('errors', []):
+                            st.write(e)
 
     with tab_bal:
         st.subheader("資產與負債配比")
@@ -1041,6 +1262,33 @@ def render_financial_wall(symbol):
             st.dataframe(balance, use_container_width=True, height=500)
         else:
             st.info("無資產負債表資料")
+            if st.button("嘗試從網頁抓取資產負債表", key=f"scrape_bal_{symbol}"):
+                with st.spinner("正在從網頁抓取資產負債表..."):
+                    res = fetch_financials_via_web(symbol)
+                    if not res['balance'].empty:
+                        balance = res['balance']
+                        st.success("已抓到資產負債表（來自網頁）")
+                        st.dataframe(balance, use_container_width=True, height=500)
+                        try:
+                            db = get_db()
+                            cache = db.query(FinancialCache).filter_by(symbol=symbol).first()
+                            if not cache:
+                                cache = FinancialCache(symbol=symbol)
+                                db.add(cache)
+                            cache.fetched_at = datetime.datetime.now()
+                            cache.balance_csv = balance.to_csv() if not balance.empty else ''
+                            db.commit()
+                            db.close()
+                        except Exception:
+                            try:
+                                db.rollback()
+                                db.close()
+                            except Exception:
+                                pass
+                    else:
+                        st.error("未能從網頁抓到資產負債表，查看錯誤訊息")
+                        for e in res.get('errors', []):
+                            st.write(e)
 
     with tab_cas:
         st.subheader("現金流向監控")
@@ -1048,6 +1296,33 @@ def render_financial_wall(symbol):
             st.dataframe(cashflow, use_container_width=True, height=500)
         else:
             st.info("無現金流量表資料")
+            if st.button("嘗試從網頁抓取現金流量表", key=f"scrape_cas_{symbol}"):
+                with st.spinner("正在從網頁抓取現金流量表..."):
+                    res = fetch_financials_via_web(symbol)
+                    if not res['cashflow'].empty:
+                        cashflow = res['cashflow']
+                        st.success("已抓到現金流量表（來自網頁）")
+                        st.dataframe(cashflow, use_container_width=True, height=500)
+                        try:
+                            db = get_db()
+                            cache = db.query(FinancialCache).filter_by(symbol=symbol).first()
+                            if not cache:
+                                cache = FinancialCache(symbol=symbol)
+                                db.add(cache)
+                            cache.fetched_at = datetime.datetime.now()
+                            cache.cashflow_csv = cashflow.to_csv() if not cashflow.empty else ''
+                            db.commit()
+                            db.close()
+                        except Exception:
+                            try:
+                                db.rollback()
+                                db.close()
+                            except Exception:
+                                pass
+                    else:
+                        st.error("未能從網頁抓到現金流量表，查看錯誤訊息")
+                        for e in res.get('errors', []):
+                            st.write(e)
 
     st.markdown("## 💎 法人籌碼與內部人監控")
     c1, c2 = st.columns(2)
@@ -1063,6 +1338,18 @@ def render_financial_wall(symbol):
             st.dataframe(major, use_container_width=True)
         else:
             st.info("無前十大持股資料")
+
+    # 嘗試顯示三大法人近 10 日買賣超（若可取得）
+    try:
+        three_df, three_msg = try_fetch_three_major_flow(symbol, days=10)
+        st.subheader("三大法人近 10 日買賣超（外資 / 投信 / 自營商）")
+        if isinstance(three_df, pd.DataFrame) and not three_df.empty:
+            st.dataframe(three_df, use_container_width=True)
+        else:
+            st.info("無法自動取得三大法人買賣超資料。\n" + str(three_msg))
+            st.write("若需自動取得，可安裝或設定資料來源，例如 `twstock` 套件或允許後端抓取 TWSE/Yahoo Taiwan 的歷史法人資料。")
+    except Exception as e:
+        st.info("三大法人資料載入失敗: " + str(e))
 
     # 關鍵指標
     c3, c4, c5 = st.columns(3)
@@ -1088,7 +1375,33 @@ def main():
         @keyframes harry-blinker { 0%{opacity:1} 50%{opacity:0.15; transform:scale(0.92);} 100%{opacity:1} }
         @keyframes harry-pulse { 0%{box-shadow:0 0 0 0 rgba(255,255,255,0)} 70%{box-shadow:0 0 12px 6px rgba(255,255,255,0.02);} 100%{box-shadow:0 0 0 0 rgba(255,255,255,0);} }
         @keyframes marquee { 0%{transform:translateX(0%)} 100%{transform:translateX(-100%)} }
+
+        /* 已結算淡出標籤 */
+        .settled-badge { display:inline-block; padding:4px 8px; background:#10b981; color:#fff; border-radius:6px; font-size:12px; animation: settled-fade 1s forwards; }
+        @keyframes settled-fade { 0% { opacity: 1; transform: translateY(0); } 100% { opacity: 0; transform: translateY(-8px); } }
+
+        /* 登入歡迎樣式 */
+        .login-welcome { display:inline-flex; align-items:center; gap:12px; padding:10px 14px; background: linear-gradient(90deg,#34d399,#60a5fa); color:#041025; border-radius:8px; box-shadow: 0 6px 18px rgba(0,0,0,0.4); }
+        .login-light { width:16px; height:16px; border-radius:50%; background:#fff; box-shadow:0 0 10px rgba(255,255,255,0.6); animation: harry-blinker 0.8s linear infinite; }
+
     </style>""", unsafe_allow_html=True)
+
+    # 登入成功歡迎動畫（若剛登入）
+    if st.session_state.get('just_logged_in'):
+        try:
+            user_w = st.session_state.get('user', '使用者')
+            container = st.container()
+            container.markdown(f"""<div class='login-welcome'><div class='login-light'></div><div><strong>登入成功，歡迎 {user_w}</strong></div></div>""", unsafe_allow_html=True)
+            time.sleep(1.2)
+            st.session_state['just_logged_in'] = False
+            try:
+                container.empty()
+            except Exception:
+                pass
+            st.experimental_rerun()
+        except Exception:
+            st.session_state['just_logged_in'] = False
+            pass
 
     if "logged" not in st.session_state:
         st.session_state.logged = False
@@ -1124,7 +1437,9 @@ def main():
                     st.session_state.logged = True
                     st.session_state.user = u
                     st.session_state.role = user.role
-                    st.success("登入成功")
+                    # 標記為剛登入以顯示歡迎動畫，稍後在 main() 處理
+                    st.session_state['just_logged_in'] = True
+                    st.session_state['just_logged_in_at'] = time.time()
                     st.rerun()
                 else:
                     st.error("帳號或密碼錯誤")
@@ -1158,7 +1473,8 @@ def main():
         if is_market_open(now):
             render_status_light("市場開盤中", color="#10b981", blink=True)
         else:
-            render_status_light("市場休市", color="#6b7280", blink=False)
+            # 休市也要閃爍以維持一致的視覺動態
+            render_status_light("市場休市", color="#6b7280", blink=True)
 
         st.subheader("📢 系統公告")
         db = get_db()
@@ -1188,26 +1504,95 @@ def main():
         render_financial_wall(target)
         
         st.divider()
+        st.divider()
         st.subheader("📊 技術圖表")
+
+        # 圖表參數選項
+        with st.expander("圖表設定", expanded=False):
+            period = st.selectbox("資料期間", ["1y", "180d", "90d", "60d", "30d"], index=0)
+            ma_input = st.text_input("顯示均線 (逗號分隔，例: 5,10,20)", "5,10,20,60")
+            show_bb = st.checkbox("顯示布林帶", value=True)
+            bb_window = st.number_input("布林窗格 (window)", min_value=5, max_value=200, value=20)
+            bb_std = st.number_input("布林標準差倍數", min_value=0.5, max_value=5.0, value=2.0, step=0.1)
+            show_macd = st.checkbox("顯示 MACD", value=True)
+            macd_short = st.number_input("MACD 短期 EMA", min_value=3, max_value=50, value=12)
+            macd_long = st.number_input("MACD 長期 EMA", min_value=6, max_value=100, value=26)
+            macd_signal = st.number_input("MACD signal 週期", min_value=3, max_value=50, value=9)
+            show_rsi = st.checkbox("顯示 RSI", value=False)
+            rsi_period = st.number_input("RSI 週期", min_value=5, max_value=50, value=14)
+
         try:
             with st.spinner(f"正在繪製 {target} 的圖表..."):
-                hist = yf.Ticker(target).history(period="1y")
-                if not hist.empty:
-                    # 移除 OHLC 任一為空的列，避免空資料導致 K 棒繪製失真
+                hist = yf.Ticker(target).history(period=period)
+                if hist is None or hist.empty:
+                    st.warning("無法取得歷史資料")
+                else:
+                    # 移除 OHLC 任一為空的列
                     hist_clean = hist.dropna(subset=['Open', 'High', 'Low', 'Close'])
                     if hist_clean.empty:
                         st.warning("歷史資料無有效 OHLC 資料，無法繪製 K 棒")
                     else:
-                        df = HarryEngine.get_indicators(hist_clean)
-                        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.02)
-                        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], 
-                                                    low=df['Low'], close=df['Close'], name="K棒"), row=1, col=1)
-                        fig.add_trace(go.Bar(x=df.index, y=df['MACD_HIST'], name="MACD"), row=2, col=1)
-                        fig.add_trace(go.Scatter(x=df.index, y=df['BIAS_25'], name="25日乖離"), row=3, col=1)
-                        fig.update_layout(height=900, template="plotly_dark", xaxis_rangeslider_visible=False)
+                        df = hist_clean.copy()
+                        # 額外均線
+                        ma_windows = []
+                        try:
+                            ma_windows = [int(x.strip()) for x in ma_input.split(',') if x.strip()]
+                        except Exception:
+                            ma_windows = [5,10,20]
+                        for n in ma_windows:
+                            if n > 0:
+                                df[f"MA{n}"] = df['Close'].rolling(window=n).mean()
+
+                        # 布林帶
+                        if show_bb and bb_window > 0:
+                            df['BB_MA'] = df['Close'].rolling(window=bb_window).mean()
+                            df['BB_STD'] = df['Close'].rolling(window=bb_window).std()
+                            df['BB_UP'] = df['BB_MA'] + (df['BB_STD'] * bb_std)
+                            df['BB_LOW'] = df['BB_MA'] - (df['BB_STD'] * bb_std)
+
+                        # MACD
+                        if show_macd:
+                            df['MACD_LINE'], df['MACD_SIGNAL'], df['MACD_HIST'] = compute_macd(df['Close'], short=macd_short, long=macd_long, signal=macd_signal)
+
+                        # RSI
+                        if show_rsi:
+                            df['RSI'] = compute_rsi(df['Close'], period=int(rsi_period))
+
+                        # 決定子圖數量
+                        indicator_rows = []
+                        if show_macd:
+                            indicator_rows.append('macd')
+                        if show_rsi:
+                            indicator_rows.append('rsi')
+                        # BIAS 或其他指標預留
+
+                        rows = 1 + len(indicator_rows)
+                        fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6] + [0.2]*len(indicator_rows))
+
+                        # K 棒
+                        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K棒"), row=1, col=1)
+                        # 加入均線
+                        for n in ma_windows:
+                            if f"MA{n}" in df.columns:
+                                fig.add_trace(go.Scatter(x=df.index, y=df[f"MA{n}"], mode='lines', name=f"MA{n}"), row=1, col=1)
+
+                        # 布林帶
+                        if show_bb and 'BB_UP' in df.columns:
+                            fig.add_trace(go.Scatter(x=df.index, y=df['BB_UP'], line={'color':'rgba(255,255,255,0.15)'}, name='BB上軌', showlegend=True), row=1, col=1)
+                            fig.add_trace(go.Scatter(x=df.index, y=df['BB_LOW'], line={'color':'rgba(255,255,255,0.15)'}, name='BB下軌', showlegend=True), row=1, col=1)
+
+                        # 指標區塊
+                        row_idx = 2
+                        if show_macd:
+                            fig.add_trace(go.Bar(x=df.index, y=df['MACD_HIST'], name='MACD_HIST'), row=row_idx, col=1)
+                            fig.add_trace(go.Scatter(x=df.index, y=df['MACD_LINE'], name='MACD_LINE', line={'width':1}), row=row_idx, col=1)
+                            fig.add_trace(go.Scatter(x=df.index, y=df['MACD_SIGNAL'], name='MACD_SIGNAL', line={'width':1, 'dash':'dot'}), row=row_idx, col=1)
+                            row_idx += 1
+                        if show_rsi:
+                            fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI'), row=row_idx, col=1)
+
+                        fig.update_layout(height=900, template='plotly_dark', xaxis_rangeslider_visible=False)
                         st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.warning("無法取得歷史資料")
         except Exception as e:
             logger.error(f"Chart rendering error: {e}")
             st.error(f"圖表繪製失敗: {e}")
@@ -1222,15 +1607,39 @@ def main():
         if st.button("加入自選") and ns:
             add_watchlist(user, ns.upper())
             st.rerun()
-
         if wl:
+            st.write("**我的自選**")
             for w in wl:
-                cols = st.columns([4, 1, 1])
+                cols = st.columns([2.2, 1.0, 1.0, 1.0, 1.0])
                 cols[0].write(f"**{w.symbol}**")
-                if cols[1].button("查看", key=f"w_{w.id}"):
+                # 取得最新報價摘要
+                quote = get_latest_quote_info(w.symbol)
+                price = quote.get('price')
+                prev = quote.get('prev_close')
+                change = quote.get('change')
+                vol = quote.get('volume')
+                # 顯示最新價格
+                cols[1].write(f"{price:.2f}" if price is not None else "N/A")
+                # 漲跌
+                if change is not None:
+                    cols[2].write(f"{change:.2f}")
+                else:
+                    cols[2].write("N/A")
+                # 當日成交張數（若有 volume，轉為張數）
+                if vol:
+                    try:
+                        zhang = int(vol / 1000)
+                        cols[3].write(f"{zhang:,} 張")
+                    except Exception:
+                        cols[3].write(f"{vol}")
+                else:
+                    cols[3].write("N/A")
+
+                # 操作按鈕：查看 / 刪除
+                if cols[4].button("查看", key=f"w_{w.id}"):
                     st.session_state._search_target = w.symbol
                     st.rerun()
-                if cols[2].button("刪除", key=f"wd_{w.id}"):
+                if cols[4].button("刪除", key=f"wd_{w.id}"):
                     remove_watchlist(user, w.symbol)
                     st.rerun()
         else:
@@ -1292,6 +1701,31 @@ def main():
         st.metric("目前資產淨值", f"{metrics['current_value']:.2f}")
         st.metric("總報酬 (%)", f"{metrics['total_return_pct']:.2f}%")
 
+        # 資產淨值歷史圖
+        st.subheader("📈 資產淨值歷史")
+        db = get_db()
+        snaps = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.created_at.asc()).all()
+        db.close()
+        if snaps:
+            df_snaps = pd.DataFrame([{"time": s.created_at, "value": s.value} for s in snaps])
+            df_snaps['time'] = pd.to_datetime(df_snaps['time'])
+            df_snaps = df_snaps.set_index('time')
+            st.line_chart(df_snaps['value'])
+        else:
+            st.info("尚無歷史快照")
+
+        # 交易紀錄 (最近50筆)
+        st.subheader("🧾 交易紀錄 (最近50筆)")
+        db = get_db()
+        txs = db.query(ManagerTransaction).order_by(ManagerTransaction.created_at.desc()).limit(50).all()
+        db.close()
+        if txs:
+            df_txs = pd.DataFrame([{"時間": t.created_at, "操作者": t.actor, "動作": t.action, "代碼": t.symbol, "股數": t.shares, "價格": t.price} for t in txs])
+            df_txs['時間'] = pd.to_datetime(df_txs['時間'])
+            st.dataframe(df_txs)
+        else:
+            st.info("尚無交易紀錄")
+
         st.subheader("訂閱管理")
         sub_email = st.text_input("訂閱 Email")
         if st.button("訂閱") and sub_email:
@@ -1327,7 +1761,16 @@ def main():
             if st.button("結算所有持股"):
                 try:
                     summary = settle_portfolio(st.session_state.user)
-                    st.success(f"已結算 {len(summary)} 檔")
+                    if summary:
+                        symbols = [s['symbol'] for s in summary]
+                        st.session_state['just_settled'] = symbols
+                        st.success(f"已結算 {len(summary)} 檔")
+                        # 顯示 1 秒後自動刷新以觸發淡出效果
+                        time.sleep(1)
+                        st.session_state.pop('just_settled', None)
+                        st.experimental_rerun()
+                    else:
+                        st.info("沒有持股可結算")
                 except Exception as e:
                     st.error(f"結算失敗: {e}")
 
@@ -1338,18 +1781,36 @@ def main():
         db.close()
         
         if holdings:
-            rows = []
+            # 標題列
+            cols_h = st.columns([1.6,1.2,0.9,1.0,1.0,1.2,1.0,1.0])
+            cols_h[0].write("**代碼**")
+            cols_h[1].write("**買入日期**")
+            cols_h[2].write("**股數**")
+            cols_h[3].write("**買入價格**")
+            cols_h[4].write("**現價**")
+            cols_h[5].write("**獲利/虧損**")
+            cols_h[6].write("**報酬率(%)**")
+            cols_h[7].write("**狀態**")
+
+            just_settled = set(st.session_state.get('just_settled', []) or [])
             for h in holdings:
                 curp = get_latest_price(h.symbol) or 0.0
-                unreal = (curp - (h.avg_price or 0.0)) * (h.shares or 0.0)
-                rows.append({
-                    "代碼": h.symbol,
-                    "張數": h.shares,
-                    "平均成本": h.avg_price,
-                    "目前價": curp,
-                    "未實現盈虧": unreal
-                })
-            st.dataframe(pd.DataFrame(rows))
+                buy_amt = (h.avg_price or 0.0) * (h.shares or 0.0)
+                profit = (curp - (h.avg_price or 0.0)) * (h.shares or 0.0)
+                return_pct = ((curp / (h.avg_price or 1.0) - 1) * 100) if (h.avg_price and h.avg_price > 0) else 0.0
+                buy_date = h.entry_date.strftime('%Y-%m-%d') if h.entry_date else ''
+                cols = st.columns([1.6,1.2,0.9,1.0,1.0,1.2,1.0,1.0])
+                cols[0].write(f"**{h.symbol}**")
+                cols[1].write(buy_date)
+                cols[2].write(f"{h.shares}")
+                cols[3].write(f"{(h.avg_price or 0.0):.2f}")
+                cols[4].write(f"{curp:.2f}")
+                cols[5].write(f"{profit:.2f}")
+                cols[6].write(f"{return_pct:.2f}%")
+                if h.symbol in just_settled:
+                    cols[7].markdown("<span class='settled-badge'>已結算</span>", unsafe_allow_html=True)
+                else:
+                    cols[7].write("")
         else:
             st.info("尚無持股")
 
