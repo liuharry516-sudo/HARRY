@@ -1077,7 +1077,7 @@ def render_financial_wall(symbol):
 # [STAGE 4] 主介面
 # ==============================================================================
 def main():
-    st.set_page_config(page_title="HARRY SUPREME TITAN V13", layout="wide")
+    st.set_page_config(page_title="HARRY 股票系統", layout="wide")
     
     st.markdown("""<style>
         .stApp { background: linear-gradient(90deg,#05060a,#0a0e14); color: #d1d5db; }
