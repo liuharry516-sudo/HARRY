@@ -1033,6 +1033,78 @@ def get_latest_quote_info(symbol: str):
         pass
     return {'price': None, 'prev_close': None, 'change': None, 'volume': None}
 
+
+def resolve_candidate_symbol(symbol_input: str):
+    """嘗試解析使用者輸入的代碼，支援數字、自動嘗試 .TW / .TWO 候選，回傳 (resolved_symbol, price_or_None)。"""
+    if not symbol_input:
+        return None, None
+    s = symbol_input.strip().upper()
+    # 如果使用者已指定市場後綴，直接嘗試
+    if '.' in s:
+        try:
+            price = get_latest_price(s)
+            return s, price
+        except Exception:
+            return s, None
+
+    # 數字或裸代碼，優先嘗試上市 .TW，再試上櫃 .TWO，最後裸碼
+    candidates = [s + '.TW', s + '.TWO', s]
+    for cand in candidates:
+        try:
+            price = get_latest_price(cand)
+            if price and price > 0:
+                return cand, price
+        except Exception:
+            continue
+
+    # 都失敗時回傳預設候選 .TW
+    return s + '.TW', None
+
+
+def get_company_display(symbol: str) -> str:
+    """回傳顯示用的公司名稱與代碼（例如：'台積電 2330'）。若無公司名稱則回傳代碼本身。"""
+    if not symbol:
+        return ''
+    base = symbol.split('.')[0]
+    # 先查 DB cache
+    db = get_db()
+    try:
+        cache = db.query(FinancialCache).filter_by(symbol=symbol).first()
+        if not cache:
+            # 嘗試以 base 比對任何快取
+            try:
+                cache = db.query(FinancialCache).filter(FinancialCache.symbol.like(f"%{base}%")).first()
+            except Exception:
+                cache = None
+        if cache and cache.info_text:
+            try:
+                info = json.loads(cache.info_text)
+                name = info.get('shortName') or info.get('longName')
+                if name:
+                    return f"{name} {base}"
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+    # 快速嘗試從 yfinance 抓一次（輕量）
+    try:
+        info, *_ = safe_ticker_fetch(symbol, retries=1, backoff=0.5)
+        if info and isinstance(info, dict):
+            name = info.get('shortName') or info.get('longName')
+            if name:
+                return f"{name} {base}"
+    except Exception:
+        pass
+
+    # 無公司名稱時只回傳代碼
+    return f"{base}"
+
 def compute_macd(series: pd.Series, short=12, long=26, signal=9):
     ema_short = series.ewm(span=short, adjust=False).mean()
     ema_long = series.ewm(span=long, adjust=False).mean()
@@ -1441,10 +1513,12 @@ def render_financial_wall(symbol):
     data_ok = bool(info and (info.get('currentPrice') or info.get('regularMarketPrice') or (not financials.empty)))
     render_status_light("股市資料運行中" if data_ok else "資料缺失或錯誤", color=("#10b981" if data_ok else "#ef4444"), blink=True)
 
-    company_name = info.get('shortName', info.get('longName', symbol))
+    raw_name = info.get('shortName', info.get('longName', ''))
     industry = info.get('industry', '未知')
     sector = info.get('sector', '未知')
-    st.markdown(f"**{company_name}** — {industry} | {sector}")
+    code_base = symbol.split('.')[0]
+    display_label = f"{raw_name} {code_base}" if raw_name else f"{code_base}"
+    st.markdown(f"**{display_label}** — {industry} | {sector}")
     
     summary_en = info.get('longBusinessSummary', '') or ''
     if summary_en:
@@ -1499,10 +1573,18 @@ def render_financial_wall(symbol):
                 limit_down = True
 
         bg = 'transparent'
+        txt_color = '#d1d5db'
         if limit_up:
             bg = '#ef4444'
+            txt_color = '#ffffff'
         elif limit_down:
             bg = '#10b981'
+            txt_color = '#ffffff'
+        else:
+            if q_change is not None and q_change > 0:
+                txt_color = '#ef4444'
+            elif q_change is not None and q_change < 0:
+                txt_color = '#10b981'
 
         vol_display = 'N/A'
         if q_vol:
@@ -1512,9 +1594,10 @@ def render_financial_wall(symbol):
             except Exception:
                 vol_display = str(q_vol)
 
+        price_display = (f'{q_price:,.2f}' if q_price is not None else 'N/A')
         price_html = f"""
         <div style='display:flex;align-items:center;gap:12px'>
-          <div style='font-size:34px;font-weight:700;padding:8px 14px;border-radius:8px;background:{bg};color:#ffffff;min-width:160px;text-align:center;'>{(f'{q_price:,.2f}' if q_price is not None else 'N/A')}</div>
+          <div style='font-size:34px;font-weight:700;padding:8px 14px;border-radius:8px;background:{bg};color:{txt_color};min-width:160px;text-align:center;'>{price_display}</div>
           <div style='color:#d1d5db'>
             <div style='font-size:14px'>高: {(f'{q_high:,.2f}' if q_high is not None else 'N/A')} &ensp; 開: {(f'{q_open:,.2f}' if q_open is not None else 'N/A')} &ensp; 低: {(f'{q_low:,.2f}' if q_low is not None else 'N/A')} &ensp; 收: {(f'{q_close:,.2f}' if q_close is not None else 'N/A')}</div>
             <div style='font-size:13px;margin-top:6px'>成交: {vol_display} &ensp; 變動: {(f'{q_change:.2f}' if q_change is not None else 'N/A')}</div>
@@ -1527,9 +1610,10 @@ def render_financial_wall(symbol):
         if q_change is None:
             render_status_light("價格未知", color="#6b7280", blink=True)
         else:
-            # 仍用漲跌顯示燈號（顏色表示漲/跌），但漲停/跌停改以背景顯示在價格區塊
-            color = "#10b981" if q_change >= 0 else "#ef4444"
-            render_status_light("漲" if q_change >= 0 else "跌", color=color, blink=is_market_open())
+            # 仍用漲跌顯示燈號（顏色表示漲/跌），漲用紅、跌用綠
+            color = "#ef4444" if q_change > 0 else ("#10b981" if q_change < 0 else "#6b7280")
+            label = "漲" if q_change > 0 else ("跌" if q_change < 0 else "持平")
+            render_status_light(label, color=color, blink=is_market_open())
 
     # 即時走勢（分時或最近日線），若今天是假日則使用最近可得的資料；Y 軸顯示前一收盤上下 10%
     try:
@@ -1871,9 +1955,16 @@ def main():
             q = st.text_input("搜尋台股代碼 (如 2330)", "2330").strip()
         with cols[1]:
             if st.button("查詢"):
-                if q and q.isdigit():
-                    q = q + ".TW"
-                st.session_state._search_target = q.upper()
+                if q:
+                    try:
+                        resolved, price = resolve_candidate_symbol(q)
+                        if resolved:
+                            st.session_state._search_target = resolved
+                            st.session_state['_last_resolved_price'] = price
+                        else:
+                            st.session_state._search_target = q.upper()
+                    except Exception:
+                        st.session_state._search_target = (q + '.TW').upper() if q.isdigit() else q.upper()
                 st.rerun()
 
         target = st.session_state.get('_search_target', '2330.TW')
@@ -1899,6 +1990,13 @@ def main():
 
         try:
             with st.spinner(f"正在繪製 {target} 的圖表..."):
+                # 若 target 可能為裸數字，先解析為可用的 .TW / .TWO 變體
+                try:
+                    resolved_target, _ = resolve_candidate_symbol(target)
+                    if resolved_target:
+                        target = resolved_target
+                except Exception:
+                    pass
                 hist = yf.Ticker(target).history(period=period)
                 if hist is None or hist.empty:
                     st.warning("無法取得歷史資料")
@@ -1993,26 +2091,62 @@ def main():
         st.write("新增自選股")
         ns = st.text_input("代碼 (如 2330.TW)", "")
         if st.button("加入自選") and ns:
-            add_watchlist(user, ns.upper())
+            try:
+                resolved, _ = resolve_candidate_symbol(ns)
+                to_add = resolved or ns.upper()
+            except Exception:
+                to_add = ns.upper()
+            add_watchlist(user, to_add)
             st.rerun()
         if wl:
             st.write("**我的自選**")
             for w in wl:
                 cols = st.columns([2.2, 1.0, 1.0, 1.0, 1.0])
-                cols[0].write(f"**{w.symbol}**")
+                # 顯示公司名稱 + 代碼
+                try:
+                    label = get_company_display(w.symbol)
+                except Exception:
+                    label = w.symbol
+                cols[0].write(f"**{label}**")
                 # 取得最新報價摘要
                 quote = get_latest_quote_info(w.symbol)
                 price = quote.get('price')
                 prev = quote.get('prev_close')
                 change = quote.get('change')
                 vol = quote.get('volume')
-                # 顯示最新價格
-                cols[1].write(f"{price:.2f}" if price is not None else "N/A")
+                # 現價用顏色顯示
+                if price is not None:
+                    try:
+                        pct = None
+                        if prev and prev != 0:
+                            pct = (price - prev) / prev
+                        if pct is not None and pct >= 0.099:
+                            cols[1].markdown(f"<span style='background:#ef4444;color:#fff;padding:2px 6px;border-radius:4px'>{price:.2f}</span>", unsafe_allow_html=True)
+                        elif pct is not None and pct <= -0.099:
+                            cols[1].markdown(f"<span style='background:#10b981;color:#fff;padding:2px 6px;border-radius:4px'>{price:.2f}</span>", unsafe_allow_html=True)
+                        else:
+                            if change is not None and change > 0:
+                                cols[1].markdown(f"<span style='color:#ef4444'>{price:.2f}</span>", unsafe_allow_html=True)
+                            elif change is not None and change < 0:
+                                cols[1].markdown(f"<span style='color:#10b981'>{price:.2f}</span>", unsafe_allow_html=True)
+                            else:
+                                cols[1].write(f"{price:.2f}")
+                    except Exception:
+                        cols[1].write(f"{price:.2f}")
+                else:
+                    cols[1].write("N/A")
+
                 # 漲跌
                 if change is not None:
-                    cols[2].write(f"{change:.2f}")
+                    if change > 0:
+                        cols[2].markdown(f"<span style='color:#ef4444'>{change:.2f}</span>", unsafe_allow_html=True)
+                    elif change < 0:
+                        cols[2].markdown(f"<span style='color:#10b981'>{change:.2f}</span>", unsafe_allow_html=True)
+                    else:
+                        cols[2].write(f"{change:.2f}")
                 else:
                     cols[2].write("N/A")
+
                 # 當日成交張數（若有 volume，轉為張數）
                 if vol:
                     try:
@@ -2025,7 +2159,11 @@ def main():
 
                 # 操作按鈕：查看 / 刪除
                 if cols[4].button("查看", key=f"w_{w.id}"):
-                    st.session_state._search_target = w.symbol
+                    try:
+                        resolved, _ = resolve_candidate_symbol(w.symbol)
+                        st.session_state._search_target = resolved or w.symbol
+                    except Exception:
+                        st.session_state._search_target = w.symbol
                     st.rerun()
                 if cols[4].button("刪除", key=f"wd_{w.id}"):
                     remove_watchlist(user, w.symbol)
@@ -2139,29 +2277,104 @@ def main():
 
         if st.session_state.role == 'admin':
             st.subheader("交易操作")
+            # 管理員交易表單：支援查詢價格、限價與市價、並需二次確認
             with st.form("trade"):
-                t_symbol = st.text_input("代碼", "2330.TW")
+                t_symbol = st.text_input("代碼 (可輸入 2330 或 2330.TW)", "2330").strip().upper()
                 t_action = st.selectbox("動作", ["buy", "sell"])
                 t_shares = st.number_input("股數", 1.0)
-                t_price = st.number_input("價格 (0=自動取得)", 0.0)
-                
-                if st.form_submit_button("送出"):
+                t_price = st.number_input("價格 (0 = 市價)", 0.0)
+
+                # 兩個表單按鈕：查詢價格 / 準備送出（會先顯示交易明細，需再按確認）
+                if st.form_submit_button("查詢價格"):
                     try:
-                        price = float(t_price) if t_price > 0 else None
-                        if t_action == 'buy':
-                            notif = process_buy(st.session_state.user, t_symbol.upper(), float(t_shares), price)
+                        resolved, price = resolve_candidate_symbol(t_symbol)
+                        st.session_state['trade_preview'] = {'input': t_symbol, 'resolved': resolved, 'price': price}
+                    except Exception as e:
+                        st.session_state['trade_preview'] = {'input': t_symbol, 'resolved': None, 'price': None, 'error': str(e)}
+                    st.experimental_rerun()
+
+                if st.form_submit_button("準備送出"):
+                    # 建立待確認交易（不立即執行）
+                    resolved = None
+                    price_fetched = None
+                    tp = st.session_state.get('trade_preview') or {}
+                    resolved = tp.get('resolved') or t_symbol
+                    price_fetched = tp.get('price')
+                    st.session_state['pending_trade'] = {
+                        'actor': st.session_state.user,
+                        'input': t_symbol,
+                        'resolved': resolved,
+                        'action': t_action,
+                        'shares': float(t_shares),
+                        'limit_price': float(t_price),
+                        'fetched_price': price_fetched,
+                    }
+                    st.experimental_rerun()
+
+            # 顯示交易預覽與二次確認
+            pending = st.session_state.get('pending_trade')
+            if pending:
+                st.markdown("---")
+                st.subheader("請確認交易明細")
+                st.write(f"操作者：{pending.get('actor')}")
+                st.write(f"輸入代碼：{pending.get('input')}  →  解析為：{pending.get('resolved')}")
+                # 顯示價格：若限價>0使用限價，否則顯示抓到的即時價格或提示無價
+                price_to_show = pending.get('limit_price') if pending.get('limit_price') and pending.get('limit_price') > 0 else pending.get('fetched_price')
+                if price_to_show is None:
+                    st.warning("目前無法取得市價，若要以市價下單請先查詢價格或改為限價下單")
+                st.write(f"動作：{pending.get('action').upper()}  股數：{pending.get('shares')}  價格：{price_to_show if price_to_show is not None else 'N/A'}")
+
+                colc1, colc2 = st.columns([1,1])
+                if colc1.button("確認送出"):
+                    # 執行交易：若為市價且無 fetched_price，嘗試再次抓價
+                    use_price = pending.get('limit_price') if pending.get('limit_price') and pending.get('limit_price') > 0 else None
+                    resolved_symbol = pending.get('resolved')
+                    if use_price is None:
+                        # 需市價
+                        try:
+                            resolved_symbol, latest = resolve_candidate_symbol(resolved_symbol)
+                            if latest is None or latest <= 0:
+                                st.error("無法取得市價，交易取消")
+                                del st.session_state['pending_trade']
+                                st.experimental_rerun()
+                            use_price = latest
+                        except Exception:
+                            st.error("取得市價失敗，交易取消")
+                            del st.session_state['pending_trade']
+                            st.experimental_rerun()
+
+                    try:
+                        if pending.get('action') == 'buy':
+                            notif = process_buy(pending.get('actor'), resolved_symbol, pending.get('shares'), use_price)
                         else:
-                            notif = process_sell(st.session_state.user, t_symbol.upper(), float(t_shares), price)
-                        
+                            notif = process_sell(pending.get('actor'), resolved_symbol, pending.get('shares'), use_price)
+                        st.success("交易已執行並記錄")
                         if isinstance(notif, dict):
                             mode = notif.get('mode')
                             if mode == 'smtp':
                                 st.success(f"已寄出通知給 {notif.get('sent_count', 0)} 位訂閱者")
                             elif mode == 'outbox':
                                 st.info(f"已寫入 {notif.get('outbox_written', 0)} 封郵件到本地 outbox")
-                        st.success("交易已紀錄")
                     except Exception as e:
                         st.error(f"交易失敗: {e}")
+                    finally:
+                        try:
+                            del st.session_state['pending_trade']
+                        except Exception:
+                            pass
+                        try:
+                            del st.session_state['trade_preview']
+                        except Exception:
+                            pass
+                        st.experimental_rerun()
+
+                if colc2.button("取消"):
+                    try:
+                        del st.session_state['pending_trade']
+                    except Exception:
+                        pass
+                    st.info("已取消交易")
+                    st.experimental_rerun()
 
             if st.button("結算所有持股"):
                 try:
@@ -2188,7 +2401,7 @@ def main():
         if holdings:
             # 標題列
             cols_h = st.columns([1.6,1.2,0.9,1.0,1.0,1.2,1.0,1.0])
-            cols_h[0].write("**代碼**")
+            cols_h[0].write("**名稱**")
             cols_h[1].write("**買入日期**")
             cols_h[2].write("**股數**")
             cols_h[3].write("**買入價格**")
@@ -2199,17 +2412,49 @@ def main():
 
             just_settled = set(st.session_state.get('just_settled', []) or [])
             for h in holdings:
-                curp = get_latest_price(h.symbol) or 0.0
+                # 取得即時報價摘要，用以顯示顏色與漲跌
+                quote = get_latest_quote_info(h.symbol)
+                curp = quote.get('price') or 0.0
+                prev = quote.get('prev_close')
+                change = quote.get('change')
                 buy_amt = (h.avg_price or 0.0) * (h.shares or 0.0)
                 profit = (curp - (h.avg_price or 0.0)) * (h.shares or 0.0)
                 return_pct = ((curp / (h.avg_price or 1.0) - 1) * 100) if (h.avg_price and h.avg_price > 0) else 0.0
                 buy_date = h.entry_date.strftime('%Y-%m-%d') if h.entry_date else ''
                 cols = st.columns([1.6,1.2,0.9,1.0,1.0,1.2,1.0,1.0])
-                cols[0].write(f"**{h.symbol}**")
+                # 公司名稱與代碼顯示為：公司 中文 名稱 + 空格 + 代碼
+                try:
+                    label = get_company_display(h.symbol)
+                except Exception:
+                    label = h.symbol
+                cols[0].write(f"**{label}**")
                 cols[1].write(buy_date)
                 cols[2].write(f"{h.shares}")
                 cols[3].write(f"{(h.avg_price or 0.0):.2f}")
-                cols[4].write(f"{curp:.2f}")
+
+                # 現價與漲跌顯示（漲紅、跌綠；漲停/跌停白字底色）
+                price_html = ''
+                try:
+                    pct = None
+                    if prev and prev != 0:
+                        pct = (curp - prev) / prev
+                    # 判斷漲停/跌停（簡化為 >=9.9% / <=-9.9%）
+                    if pct is not None and pct >= 0.099:
+                        price_html = f"<span style='background:#ef4444;color:#fff;padding:2px 6px;border-radius:4px'>{curp:.2f}</span>"
+                    elif pct is not None and pct <= -0.099:
+                        price_html = f"<span style='background:#10b981;color:#fff;padding:2px 6px;border-radius:4px'>{curp:.2f}</span>"
+                    else:
+                        if change is not None and change > 0:
+                            price_html = f"<span style='color:#ef4444'>{curp:.2f}</span>"
+                        elif change is not None and change < 0:
+                            price_html = f"<span style='color:#10b981'>{curp:.2f}</span>"
+                        else:
+                            price_html = f"{curp:.2f}"
+                except Exception:
+                    price_html = f"{curp:.2f}"
+                cols[4].markdown(price_html, unsafe_allow_html=True)
+
+                # 獲利與報酬率
                 cols[5].write(f"{profit:.2f}")
                 cols[6].write(f"{return_pct:.2f}%")
                 if h.symbol in just_settled:
