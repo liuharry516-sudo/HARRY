@@ -902,20 +902,57 @@ def translate_to_zh(summary: str, symbol: str = None) -> str:
     return translated
 
 def get_price_trend_series(symbol: str):
-    """回傳最近的價格序列（Series），優先使用近幾天的即時/分時資料，若無則回傳日線收盤價序列。"""
+    """回傳當天 9:00-13:30 的分時價格序列（Series）。
+    若當天無資料，會嘗試取得最近一個有分時資料的日子；若仍無，回傳日線收盤序列。
+    """
     try:
         tk = yf.Ticker(symbol)
-        # 優先嘗試分時（近 7 日，5 分），若無資料再使用日線
+        # 優先取得當天的分時 (5m)
         try:
-            intr = tk.history(period='7d', interval='5m')
+            intr = tk.history(period='1d', interval='5m')
             if intr is not None and not intr.empty and 'Close' in intr.columns:
                 s = intr['Close'].dropna()
                 if not s.empty:
-                    return s
+                    # 將 index 轉為台北時區，再過濾 09:00~13:30
+                    try:
+                        idx = pd.to_datetime(s.index)
+                        if idx.tz is None:
+                            idx = idx.tz_localize('UTC').tz_convert('Asia/Taipei')
+                        else:
+                            idx = idx.tz_convert('Asia/Taipei')
+                        s.index = idx
+                        s = s.between_time('09:00', '13:30')
+                    except Exception:
+                        pass
+                    if not s.empty:
+                        return s
         except Exception:
             pass
 
-        # Fallback: 日線
+        # 若當天無分時，嘗試取得近 7 日分時，取最後一個有資料的完整日
+        try:
+            intr7 = tk.history(period='7d', interval='5m')
+            if intr7 is not None and not intr7.empty and 'Close' in intr7.columns:
+                s_all = intr7['Close'].dropna()
+                try:
+                    idx = pd.to_datetime(s_all.index)
+                    if idx.tz is None:
+                        idx = idx.tz_localize('UTC').tz_convert('Asia/Taipei')
+                    else:
+                        idx = idx.tz_convert('Asia/Taipei')
+                    s_all.index = idx
+                    # 取最後一個有資料的日期
+                    last_date = s_all.index.date[-1]
+                    s_day = s_all[s_all.index.date == last_date]
+                    s_day = s_day.between_time('09:00', '13:30')
+                    if not s_day.empty:
+                        return s_day
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 最後退回日線收盤序列
         try:
             hist = tk.history(period='180d')
             if hist is not None and not hist.empty and 'Close' in hist.columns:
@@ -994,6 +1031,65 @@ def compute_macd(series: pd.Series, short=12, long=26, signal=9):
     macd_hist = macd_line - macd_signal
     return macd_line, macd_signal, macd_hist
 
+def _clean_and_aggregate_ohlc(hist: pd.DataFrame) -> pd.DataFrame:
+    """清理 OHLC 資料：移除 NA/0，並將 intraday 資料合併為每日 OHLC。"""
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+    df = hist.copy()
+    # 確保有必要欄位
+    for col in ['Open', 'High', 'Low', 'Close']:
+        if col not in df.columns:
+            return pd.DataFrame()
+
+    # Drop NA in OHLC
+    df = df.dropna(subset=['Open', 'High', 'Low', 'Close'])
+    # Drop rows where OHLC are zero
+    try:
+        df = df[(df['Open'] != 0) & (df['High'] != 0) & (df['Low'] != 0) & (df['Close'] != 0)]
+    except Exception:
+        pass
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # 若 index 含 time component（intraday），將同一天合併為日 K
+    try:
+        idx = pd.to_datetime(df.index)
+        has_time = any([t != datetime.time(0, 0) for t in idx.time])
+    except Exception:
+        has_time = False
+
+    if has_time:
+        try:
+            df.index = pd.to_datetime(df.index)
+            # 轉換到台北時區並取日期
+            try:
+                if df.index.tz is None:
+                    df.index = df.index.tz_localize('UTC').tz_convert('Asia/Taipei')
+                else:
+                    df.index = df.index.tz_convert('Asia/Taipei')
+            except Exception:
+                pass
+            df['date'] = df.index.date
+            agg = df.groupby('date').agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last',
+                'Volume': 'sum'
+            })
+            agg.index = pd.to_datetime(agg.index)
+            return agg
+        except Exception:
+            pass
+
+    # 否則直接回傳已清理的日線
+    try:
+        df.index = pd.to_datetime(df.index)
+    except Exception:
+        pass
+    return df
+
 def compute_rsi(series: pd.Series, period=14):
     delta = series.diff()
     up = delta.clip(lower=0)
@@ -1016,15 +1112,31 @@ def round_half_up(n, ndigits=2):
         return float(Decimal(n).quantize(exp, rounding=ROUND_HALF_UP))
 
 def try_fetch_three_major_flow(symbol: str, days: int = 10):
-    """嘗試用 `twstock` 或其他方法擷取三大法人近 N 日買賣超，若無法取得回傳空 DataFrame 與說明訊息。"""
-    # 先嘗試 twstock（如已安裝）
+    """嘗試從 Yahoo（台股頁面或 finance.yahoo.com）抓三大法人買賣超表格。
+    回傳 (DataFrame, message)。若無法取得則回傳空 DataFrame 與原因說明。
+    """
+    code = symbol.replace('.TW', '').replace('.T', '')
+    urls = [f"https://tw.stock.yahoo.com/quote/{code}", f"https://finance.yahoo.com/quote/{symbol}/holders", f"https://finance.yahoo.com/quote/{symbol}"]
     try:
-        import twstock
-        code = symbol.replace('.TW', '').replace('.T', '')
-        # twstock 尚未提供直接的三大法人日買賣超 API 在本地端，回傳空表並提醒
-        return pd.DataFrame(), 'twstock 已安裝，但本程式需額外實作從 TWSE 或公開 API 取得三大法人資料'
+        import requests
     except Exception:
-        return pd.DataFrame(), '請安裝 twstock 或允許後端網路抓取三大法人資料（需另行實作）'
+        return pd.DataFrame(), 'requests 未安裝，無法抓取 Yahoo 資料'
+
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=8, headers=headers)
+            r.raise_for_status()
+            tables = pd.read_html(r.text)
+            for t in tables:
+                cols_text = ' '.join([str(c) for c in t.columns]).lower()
+                # 判斷可能包含三大法人關鍵字
+                if any(k in cols_text for k in ('外資', '投信', '自營商', 'foreign', 'investment', 'trust', 'dealer')):
+                    return t, f'從 {url} 擷取到法人表格'
+        except Exception:
+            continue
+
+    return pd.DataFrame(), '未能從 Yahoo 自動取得三大法人買賣超表格'
 
 def fetch_financials_via_web(symbol: str):
     """嘗試從 Yahoo Finance 網頁抓取財務報表表格（損益表、資產負債表、現金流量表）。
@@ -1057,23 +1169,34 @@ def compute_portfolio_metrics():
     try:
         p = init_portfolio() or PortfolioMeta()
         holdings = db.query(ManagerHolding).filter(ManagerHolding.active == True).all()
+        # current total value = cash + market value of holdings
         current_value = compute_portfolio_value()
-        initial = p.initial_capital or 0.0
-        total_pnl = current_value - initial
-        
+        initial = float(p.initial_capital or 0.0)
+
+        # 計算未實現損益（市價 - 平均成本）
         unrealized = 0.0
         for h in holdings:
             price = get_latest_price(h.symbol) or 0.0
             unrealized += (price - (h.avg_price or 0.0)) * (h.shares or 0.0)
-        
-        realized = total_pnl - unrealized
+
+        # 計算已實現損益：由交易紀錄中 sell 動作的 realized 欄位累加
+        try:
+            sells = db.query(ManagerTransaction).filter(ManagerTransaction.action == 'sell').all()
+            realized = sum([getattr(t, 'realized', 0.0) or 0.0 for t in sells])
+        except Exception:
+            realized = 0.0
+
+        # 總損益 = 已實現 + 未實現
+        total_pnl = realized + unrealized
+
+        total_return_pct = (total_pnl / initial * 100.0) if initial else 0.0
+
         db.close()
-        
         return {
             'initial': initial,
             'current_value': current_value,
             'total_pnl': total_pnl,
-            'total_return_pct': (current_value / initial - 1) * 100 if initial else 0.0,
+            'total_return_pct': total_return_pct,
             'realized': realized,
             'unrealized': unrealized,
         }
@@ -1575,6 +1698,24 @@ def main():
             if 'blink_speed' not in st.session_state:
                 st.session_state.blink_speed = 1.0
             st.session_state.blink_speed = st.slider("閃爍速度", 0.2, 3.0, float(st.session_state.blink_speed), 0.1)
+            # 我的帳號：修改密碼
+            with st.expander("我的帳號", expanded=False):
+                try:
+                    with st.form("change_my_pw"):
+                        cur_pw = st.text_input("目前密碼", type='password')
+                        new_pw = st.text_input("新密碼", type='password')
+                        if st.form_submit_button("更新我的密碼"):
+                            db = get_db()
+                            u = db.query(User).filter_by(username=st.session_state.user).first()
+                            if u and verify_password(u.password, cur_pw, u.username):
+                                u.password = hash_password(new_pw, u.username)
+                                db.commit()
+                                st.success("密碼已更新")
+                            else:
+                                st.error("目前密碼驗證失敗")
+                            db.close()
+                except Exception:
+                    pass
             
             menu = st.radio("功能導航", [
                 "回首頁", 
@@ -1666,67 +1807,70 @@ def main():
                     if hist_clean.empty:
                         st.warning("歷史資料無有效 OHLC 資料，無法繪製 K 棒")
                     else:
-                        df = hist_clean.copy()
-                        # 額外均線
-                        ma_windows = []
-                        try:
-                            ma_windows = [int(x.strip()) for x in ma_input.split(',') if x.strip()]
-                        except Exception:
-                            ma_windows = [5,10,20]
-                        for n in ma_windows:
-                            if n > 0:
-                                df[f"MA{n}"] = df['Close'].rolling(window=n).mean()
+                        # 合併/清理 OHLC，得到日 K
+                        df = _clean_and_aggregate_ohlc(hist_clean)
+                        if df is None or df.empty:
+                            st.warning("無有效 K 棒資料可繪製")
+                        else:
+                            # 額外均線
+                            ma_windows = []
+                            try:
+                                ma_windows = [int(x.strip()) for x in ma_input.split(',') if x.strip()]
+                            except Exception:
+                                ma_windows = [5,10,20]
+                            for n in ma_windows:
+                                if n > 0:
+                                    df[f"MA{n}"] = df['Close'].rolling(window=n).mean()
 
-                        # 布林帶
-                        if show_bb and bb_window > 0:
-                            df['BB_MA'] = df['Close'].rolling(window=bb_window).mean()
-                            df['BB_STD'] = df['Close'].rolling(window=bb_window).std()
-                            df['BB_UP'] = df['BB_MA'] + (df['BB_STD'] * bb_std)
-                            df['BB_LOW'] = df['BB_MA'] - (df['BB_STD'] * bb_std)
+                            # 布林帶
+                            if show_bb and bb_window > 0:
+                                df['BB_MA'] = df['Close'].rolling(window=bb_window).mean()
+                                df['BB_STD'] = df['Close'].rolling(window=bb_window).std()
+                                df['BB_UP'] = df['BB_MA'] + (df['BB_STD'] * bb_std)
+                                df['BB_LOW'] = df['BB_MA'] - (df['BB_STD'] * bb_std)
 
-                        # MACD
-                        if show_macd:
-                            df['MACD_LINE'], df['MACD_SIGNAL'], df['MACD_HIST'] = compute_macd(df['Close'], short=macd_short, long=macd_long, signal=macd_signal)
+                            # MACD
+                            if show_macd:
+                                df['MACD_LINE'], df['MACD_SIGNAL'], df['MACD_HIST'] = compute_macd(df['Close'], short=macd_short, long=macd_long, signal=macd_signal)
 
-                        # RSI
-                        if show_rsi:
-                            df['RSI'] = compute_rsi(df['Close'], period=int(rsi_period))
+                            # RSI
+                            if show_rsi:
+                                df['RSI'] = compute_rsi(df['Close'], period=int(rsi_period))
 
-                        # 決定子圖數量
-                        indicator_rows = []
-                        if show_macd:
-                            indicator_rows.append('macd')
-                        if show_rsi:
-                            indicator_rows.append('rsi')
-                        # BIAS 或其他指標預留
+                            # 決定子圖數量
+                            indicator_rows = []
+                            if show_macd:
+                                indicator_rows.append('macd')
+                            if show_rsi:
+                                indicator_rows.append('rsi')
 
-                        rows = 1 + len(indicator_rows)
-                        fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6] + [0.2]*len(indicator_rows))
+                            rows = 1 + len(indicator_rows)
+                            fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6] + [0.2]*len(indicator_rows))
 
-                        # K 棒
-                        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K棒"), row=1, col=1)
-                        # 加入均線
-                        for n in ma_windows:
-                            if f"MA{n}" in df.columns:
-                                fig.add_trace(go.Scatter(x=df.index, y=df[f"MA{n}"], mode='lines', name=f"MA{n}"), row=1, col=1)
+                            # K 棒
+                            fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K棒"), row=1, col=1)
+                            # 加入均線
+                            for n in ma_windows:
+                                if f"MA{n}" in df.columns:
+                                    fig.add_trace(go.Scatter(x=df.index, y=df[f"MA{n}"], mode='lines', name=f"MA{n}"), row=1, col=1)
 
-                        # 布林帶
-                        if show_bb and 'BB_UP' in df.columns:
-                            fig.add_trace(go.Scatter(x=df.index, y=df['BB_UP'], line={'color':'rgba(255,255,255,0.15)'}, name='BB上軌', showlegend=True), row=1, col=1)
-                            fig.add_trace(go.Scatter(x=df.index, y=df['BB_LOW'], line={'color':'rgba(255,255,255,0.15)'}, name='BB下軌', showlegend=True), row=1, col=1)
+                            # 布林帶
+                            if show_bb and 'BB_UP' in df.columns:
+                                fig.add_trace(go.Scatter(x=df.index, y=df['BB_UP'], line={'color':'rgba(255,255,255,0.15)'}, name='BB上軌', showlegend=True), row=1, col=1)
+                                fig.add_trace(go.Scatter(x=df.index, y=df['BB_LOW'], line={'color':'rgba(255,255,255,0.15)'}, name='BB下軌', showlegend=True), row=1, col=1)
 
-                        # 指標區塊
-                        row_idx = 2
-                        if show_macd:
-                            fig.add_trace(go.Bar(x=df.index, y=df['MACD_HIST'], name='MACD_HIST'), row=row_idx, col=1)
-                            fig.add_trace(go.Scatter(x=df.index, y=df['MACD_LINE'], name='MACD_LINE', line={'width':1}), row=row_idx, col=1)
-                            fig.add_trace(go.Scatter(x=df.index, y=df['MACD_SIGNAL'], name='MACD_SIGNAL', line={'width':1, 'dash':'dot'}), row=row_idx, col=1)
-                            row_idx += 1
-                        if show_rsi:
-                            fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI'), row=row_idx, col=1)
+                            # 指標區塊
+                            row_idx = 2
+                            if show_macd:
+                                fig.add_trace(go.Bar(x=df.index, y=df['MACD_HIST'], name='MACD_HIST'), row=row_idx, col=1)
+                                fig.add_trace(go.Scatter(x=df.index, y=df['MACD_LINE'], name='MACD_LINE', line={'width':1}), row=row_idx, col=1)
+                                fig.add_trace(go.Scatter(x=df.index, y=df['MACD_SIGNAL'], name='MACD_SIGNAL', line={'width':1, 'dash':'dot'}), row=row_idx, col=1)
+                                row_idx += 1
+                            if show_rsi:
+                                fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI'), row=row_idx, col=1)
 
-                        fig.update_layout(height=900, template='plotly_dark', xaxis_rangeslider_visible=False)
-                        st.plotly_chart(fig, use_container_width=True)
+                            fig.update_layout(height=900, template='plotly_dark', xaxis_rangeslider_visible=False)
+                            st.plotly_chart(fig, use_container_width=True)
         except Exception as e:
             logger.error(f"Chart rendering error: {e}")
             st.error(f"圖表繪製失敗: {e}")
@@ -1844,16 +1988,19 @@ def main():
             df_snaps = pd.DataFrame([{"time": s.created_at, "value": s.value} for s in snaps])
             df_snaps['time'] = pd.to_datetime(df_snaps['time'])
             df_snaps = df_snaps.set_index('time')
-            # 使用 plotly 自訂 y 軸範圍：預設為初始資金上下50%，若有變動則以實際值為準
-            initial = metrics.get('initial', 0.0) or 0.0
+            # 使用 plotly 自訂 y 軸範圍：預設以最新淨值為基準上下50%，若歷史有波動則以 min/max 稍微延伸
+            latest_val = float(df_snaps['value'].iloc[-1])
             min_v = float(df_snaps['value'].min())
             max_v = float(df_snaps['value'].max())
-            if min_v == max_v == initial:
-                y0 = initial * 0.5
-                y1 = initial * 1.5
+            if min_v == max_v == latest_val:
+                y0 = latest_val * 0.5
+                y1 = latest_val * 1.5
             else:
                 y0 = min_v * 0.98
                 y1 = max_v * 1.02
+            # 防止 y0 為負
+            if y0 < 0:
+                y0 = 0
 
             fig_val = go.Figure()
             fig_val.add_trace(go.Scatter(x=df_snaps.index, y=df_snaps['value'], mode='lines+markers', name='資產淨值'))
@@ -2000,6 +2147,28 @@ def main():
                     {"ID": u.uid, "帳號": u.username, "權限": u.role, "啟用": u.is_active}
                     for u in users
                 ]))
+
+            # 管理員可修改任一使用者密碼
+            st.markdown("---")
+            st.subheader("使用者密碼管理 (Admin)")
+            try:
+                with st.form("admin_change_pw"):
+                    sel_user = st.selectbox("選擇使用者", [u.username for u in users]) if users else st.selectbox("選擇使用者", [])
+                    newpw = st.text_input("新密碼", type='password')
+                    if st.form_submit_button("更新選取使用者密碼"):
+                        if sel_user and newpw:
+                            db = get_db()
+                            uu = db.query(User).filter_by(username=sel_user).first()
+                            if uu:
+                                uu.password = hash_password(newpw, uu.username)
+                                db.add(AuditLog(actor=st.session_state.user, action='admin_reset_pw', target=sel_user))
+                                db.commit()
+                                st.success(f"{sel_user} 的密碼已更新")
+                            db.close()
+                        else:
+                            st.warning("請選擇使用者並輸入新密碼")
+            except Exception:
+                pass
 
             st.markdown("---")
             st.subheader("SMTP 設定")
