@@ -1152,6 +1152,17 @@ def _clean_and_aggregate_ohlc(hist: pd.DataFrame) -> pd.DataFrame:
                     df.index = df.index.tz_convert('Asia/Taipei')
             except Exception:
                 pass
+            # 只保留盤中交易時間（台北時區）09:00 - 13:30 的 ticks
+            try:
+                times = [t for t in df.index.time]
+                mask = [((t.hour > 9) or (t.hour == 9 and t.minute >= 0)) and ((t.hour < 13) or (t.hour == 13 and t.minute <= 30)) for t in times]
+                df = df.iloc[[i for i, m in enumerate(mask) if m]]
+            except Exception:
+                pass
+
+            if df.empty:
+                return pd.DataFrame()
+
             df['date'] = df.index.date
             agg = df.groupby('date').agg({
                 'Open': 'first',
@@ -1161,6 +1172,11 @@ def _clean_and_aggregate_ohlc(hist: pd.DataFrame) -> pd.DataFrame:
                 'Volume': 'sum'
             })
             agg.index = pd.to_datetime(agg.index)
+            # 移除週末（保險）
+            try:
+                agg = agg[~agg.index.to_series().dt.weekday.isin([5,6])]
+            except Exception:
+                pass
             return agg
         except Exception:
             pass
@@ -1260,28 +1276,170 @@ def fetch_financials_via_web(symbol: str):
 
     headers = {'User-Agent': 'Mozilla/5.0'}
     import re
+
+    def _extract_json_store(html: str):
+        """從 Yahoo Finance 頁面嘗試抽出 root.App.main 的 JSON，並回傳 QuoteSummaryStore（若存在）。"""
+        try:
+            marker = 'root.App.main ='
+            idx = html.find(marker)
+            if idx == -1:
+                marker = 'root.App.main='
+                idx = html.find(marker)
+            if idx == -1:
+                # 嘗試找尋 stores 中的 QuoteSummaryStore 標記位置
+                if 'QuoteSummaryStore' in html:
+                    idx = html.find('QuoteSummaryStore')
+            if idx == -1:
+                return {}
+
+            start = html.find('{', idx)
+            if start == -1:
+                return {}
+            depth = 0
+            for j in range(start, len(html)):
+                ch = html[j]
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        json_text = html[start:j+1]
+                        try:
+                            data = json.loads(json_text)
+                            store = data.get('context', {}).get('dispatcher', {}).get('stores', {}).get('QuoteSummaryStore', {})
+                            if store:
+                                return store
+                        except Exception:
+                            return {}
+            return {}
+        except Exception:
+            return {}
+
+    def _history_list_to_df(lst):
+        try:
+            rows = []
+            for item in lst:
+                r = {}
+                for k, v in item.items():
+                    if isinstance(v, dict):
+                        if 'raw' in v:
+                            r[k] = v.get('raw')
+                        elif 'fmt' in v:
+                            r[k] = v.get('fmt')
+                        else:
+                            r[k] = v
+                    else:
+                        r[k] = v
+                rows.append(r)
+            if not rows:
+                return pd.DataFrame()
+            df = pd.DataFrame(rows)
+            if 'endDate' in df.columns:
+                try:
+                    # endDate 若為 dict 則取 raw
+                    if isinstance(df['endDate'].iloc[0], dict):
+                        df['endDate'] = df['endDate'].apply(lambda d: d.get('raw') if isinstance(d, dict) else d)
+                    df['endDate'] = pd.to_datetime(df['endDate'], unit='s', errors='coerce')
+                    df = df.set_index('endDate')
+                except Exception:
+                    pass
+            return df
+        except Exception:
+            return pd.DataFrame()
+
     for cand in candidates:
         base_url = f"https://finance.yahoo.com/quote/{cand}"
-        pages = {'financials': base_url + '/financials', 'balance': base_url + '/balance-sheet', 'cashflow': base_url + '/cash-flow'}
+        pages = {
+            'financials': f"{base_url}/financials?p={cand}",
+            'balance': f"{base_url}/balance-sheet?p={cand}",
+            'cashflow': f"{base_url}/cash-flow?p={cand}"
+        }
+        page_store = {}
         for k, url in pages.items():
             try:
                 r = requests.get(url, timeout=10, headers=headers)
                 r.raise_for_status()
-                tables = pd.read_html(r.text)
-                if tables and len(tables) > 0:
-                    results[k] = tables[0]
-                    # 嘗試從頁面擷取公司中文/英文字樣
-                    if 'company_name' not in results or not results.get('company_name'):
-                        m = re.search(r'<h1[^>]*>(.*?)</h1>', r.text, re.S | re.I)
-                        if m:
-                            title = re.sub(r'<.*?>', '', m.group(1)).strip()
-                            if title:
-                                results['company_name'] = title
+                html = r.text
+                # 先嘗試從 JSON store 抽取表格資料
+                if not page_store:
+                    store = _extract_json_store(html)
+                    if store:
+                        page_store = store
+                # 嘗試用 pandas 解析（若環境有 lxml/html5lib）
+                try:
+                    tables = pd.read_html(html)
+                    if tables and len(tables) > 0:
+                        results[k] = tables[0]
+                except Exception:
+                    # 解析失敗不一定致命，會嘗試 JSON fallback
+                    pass
+
+                # 嘗試從頁面擷取公司中文/英文字樣（H1）
+                if 'company_name' not in results or not results.get('company_name'):
+                    m = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.S | re.I)
+                    if m:
+                        title = re.sub(r'<.*?>', '', m.group(1)).strip()
+                        if title:
+                            results['company_name'] = title
             except Exception as e:
                 results['errors'].append(f"{k} 取得失敗 ({cand}): {e}")
 
-        # 若已抓到任一表格，停止再嘗試其他候選（以第一個成功者為主）
-        if not results['financials'].empty or not results['balance'].empty or not results['cashflow'].empty:
+        # 如果有 JSON store，嘗試從 store 裡組成財報表格
+        try:
+            if page_store:
+                # company name & summary
+                try:
+                    pname = page_store.get('price', {}).get('shortName') or page_store.get('price', {}).get('longName')
+                    if pname:
+                        results['company_name'] = pname
+                except Exception:
+                    pass
+                try:
+                    psummary = page_store.get('summaryProfile', {}).get('longBusinessSummary') or page_store.get('assetProfile', {}).get('longBusinessSummary')
+                    if psummary:
+                        results['summary'] = psummary
+                except Exception:
+                    pass
+
+                # income statements
+                inc = None
+                for k in ('incomeStatementHistory', 'incomeStatementHistoryQuarterly', 'incomeStatementHistoryWithSubtotals'):
+                    v = page_store.get(k)
+                    if isinstance(v, dict) and v.get('incomeStatementHistory'):
+                        inc = v.get('incomeStatementHistory')
+                        break
+                    if isinstance(v, list):
+                        inc = v
+                        break
+                if inc:
+                    df_inc = _history_list_to_df(inc)
+                    if not df_inc.empty:
+                        results['financials'] = df_inc
+
+                # balance sheets
+                bal = page_store.get('balanceSheetHistory') or page_store.get('balanceSheetHistoryQuarterly')
+                if bal:
+                    if isinstance(bal, dict) and bal.get('balanceSheetStatements'):
+                        df_bal = _history_list_to_df(bal.get('balanceSheetStatements'))
+                    else:
+                        df_bal = _history_list_to_df(bal)
+                    if not df_bal.empty:
+                        results['balance'] = df_bal
+
+                # cashflow
+                cf = page_store.get('cashflowStatementHistory') or page_store.get('cashflowStatementHistoryQuarterly')
+                if cf:
+                    if isinstance(cf, dict) and cf.get('cashflowStatements'):
+                        df_cf = _history_list_to_df(cf.get('cashflowStatements'))
+                    else:
+                        df_cf = _history_list_to_df(cf)
+                    if not df_cf.empty:
+                        results['cashflow'] = df_cf
+        except Exception:
+            pass
+
+        # 若已抓到任一表格或公司名稱/summary，停止再嘗試其他候選（以第一個成功者為主）
+        if (not results['financials'].empty) or (not results['balance'].empty) or (not results['cashflow'].empty) or results.get('company_name') or results.get('summary'):
             break
 
     return results
