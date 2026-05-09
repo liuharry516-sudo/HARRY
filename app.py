@@ -29,6 +29,28 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# 安全 rerun wrapper：在某些 streamlit 版本中 experimental_rerun 可能不可用，提供回退
+def safe_rerun():
+    try:
+        # 先嘗試 experimental_rerun
+        if hasattr(st, 'experimental_rerun'):
+            try:
+                st.experimental_rerun()
+                return
+            except Exception:
+                pass
+        # 回退到 st.rerun
+        if hasattr(st, 'rerun'):
+            try:
+                st.rerun()
+                return
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"safe_rerun failed: {e}")
+    # 如果都失敗，安靜地返回（避免拋出 AttributeError 讓整個 app 崩潰）
+    return
+
 # ==============================================================================
 # [STAGE 1] 硬體級持久化鎖定 (解決「帳號重整就不見」的致命傷)
 # ==============================================================================
@@ -1752,16 +1774,33 @@ def render_financial_wall(symbol):
             except Exception:
                 vol_display = str(q_vol)
 
-        price_display = (f'{q_price:,.2f}' if q_price is not None else 'N/A')
-        price_html = f"""
-        <div style='display:flex;align-items:center;gap:12px'>
-          <div style='font-size:34px;font-weight:700;padding:8px 14px;border-radius:8px;background:{bg};color:{txt_color};min-width:160px;text-align:center;'>{price_display}</div>
-          <div style='color:#d1d5db'>
-            <div style='font-size:14px'>高: {(f'{q_high:,.2f}' if q_high is not None else 'N/A')} &ensp; 開: {(f'{q_open:,.2f}' if q_open is not None else 'N/A')} &ensp; 低: {(f'{q_low:,.2f}' if q_low is not None else 'N/A')} &ensp; 收: {(f'{q_close:,.2f}' if q_close is not None else 'N/A')}</div>
-            <div style='font-size:13px;margin-top:6px'>成交: {vol_display} &ensp; 變動: {(f'{q_change:.2f}' if q_change is not None else 'N/A')}</div>
-          </div>
-        </div>
-        """
+                price_display = (f'{q_price:,.2f}' if q_price is not None else 'N/A')
+                # 計算百分比變動
+                q_pct = None
+                try:
+                        if q_price is not None and q_prev is not None and q_prev != 0:
+                                q_pct = (q_price - q_prev) / q_prev * 100.0
+                except Exception:
+                        q_pct = None
+
+                pct_display = ''
+                if q_pct is not None:
+                        pct_color = '#ef4444' if q_pct > 0 else ('#10b981' if q_pct < 0 else '#d1d5db')
+                        sign = '+' if q_pct > 0 else ('' if q_pct == 0 else '')
+                        pct_display = f"<div style='font-size:16px;font-weight:600;color:{pct_color};margin-left:8px'>{sign}{q_pct:.2f}%</div>"
+
+                price_html = f"""
+                <div style='display:flex;align-items:center;gap:12px'>
+                    <div style='display:flex;align-items:center'>
+                        <div style='font-size:34px;font-weight:700;padding:8px 14px;border-radius:8px;background:{bg};color:{txt_color};min-width:160px;text-align:center;'>{price_display}</div>
+                        {pct_display}
+                    </div>
+                    <div style='color:#d1d5db'>
+                        <div style='font-size:14px'>高: {(f'{q_high:,.2f}' if q_high is not None else 'N/A')} &ensp; 開: {(f'{q_open:,.2f}' if q_open is not None else 'N/A')} &ensp; 低: {(f'{q_low:,.2f}' if q_low is not None else 'N/A')} &ensp; 收: {(f'{q_close:,.2f}' if q_close is not None else 'N/A')}</div>
+                        <div style='font-size:13px;margin-top:6px'>成交: {vol_display} &ensp; 變動: {(f'{q_change:.2f}' if q_change is not None else 'N/A')}</div>
+                    </div>
+                </div>
+                """
         st.markdown(price_html, unsafe_allow_html=True)
 
     with c_b:
@@ -1998,7 +2037,7 @@ def main():
                 container.empty()
             except Exception:
                 pass
-            st.experimental_rerun()
+            safe_rerun()
         except Exception:
             st.session_state['just_logged_in'] = False
             pass
@@ -2213,29 +2252,35 @@ def main():
                             rows = 1 + len(indicator_rows)
                             fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6] + [0.2]*len(indicator_rows))
 
-                            # K 棒
-                            fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K棒"), row=1, col=1)
+                            # K 棒（以分類 x 軸顯示，避免因節假日造成可視化空格）
+                            x_cat = df.index.strftime('%Y-%m-%d')
+                            fig.add_trace(go.Candlestick(x=x_cat, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K棒"), row=1, col=1)
                             # 加入均線
                             for n in ma_windows:
                                 if f"MA{n}" in df.columns:
-                                    fig.add_trace(go.Scatter(x=df.index, y=df[f"MA{n}"], mode='lines', name=f"MA{n}"), row=1, col=1)
+                                    fig.add_trace(go.Scatter(x=x_cat, y=df[f"MA{n}"], mode='lines', name=f"MA{n}"), row=1, col=1)
 
                             # 布林帶
                             if show_bb and 'BB_UP' in df.columns:
-                                fig.add_trace(go.Scatter(x=df.index, y=df['BB_UP'], line={'color':'rgba(255,255,255,0.15)'}, name='BB上軌', showlegend=True), row=1, col=1)
-                                fig.add_trace(go.Scatter(x=df.index, y=df['BB_LOW'], line={'color':'rgba(255,255,255,0.15)'}, name='BB下軌', showlegend=True), row=1, col=1)
+                                fig.add_trace(go.Scatter(x=x_cat, y=df['BB_UP'], line={'color':'rgba(255,255,255,0.15)'}, name='BB上軌', showlegend=True), row=1, col=1)
+                                fig.add_trace(go.Scatter(x=x_cat, y=df['BB_LOW'], line={'color':'rgba(255,255,255,0.15)'}, name='BB下軌', showlegend=True), row=1, col=1)
 
                             # 指標區塊
                             row_idx = 2
                             if show_macd:
-                                fig.add_trace(go.Bar(x=df.index, y=df['MACD_HIST'], name='MACD_HIST'), row=row_idx, col=1)
-                                fig.add_trace(go.Scatter(x=df.index, y=df['MACD_LINE'], name='MACD_LINE', line={'width':1}), row=row_idx, col=1)
-                                fig.add_trace(go.Scatter(x=df.index, y=df['MACD_SIGNAL'], name='MACD_SIGNAL', line={'width':1, 'dash':'dot'}), row=row_idx, col=1)
+                                fig.add_trace(go.Bar(x=x_cat, y=df['MACD_HIST'], name='MACD_HIST'), row=row_idx, col=1)
+                                fig.add_trace(go.Scatter(x=x_cat, y=df['MACD_LINE'], name='MACD_LINE', line={'width':1}), row=row_idx, col=1)
+                                fig.add_trace(go.Scatter(x=x_cat, y=df['MACD_SIGNAL'], name='MACD_SIGNAL', line={'width':1, 'dash':'dot'}), row=row_idx, col=1)
                                 row_idx += 1
                             if show_rsi:
-                                fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI'), row=row_idx, col=1)
+                                fig.add_trace(go.Scatter(x=x_cat, y=df['RSI'], name='RSI'), row=row_idx, col=1)
 
                             fig.update_layout(height=900, template='plotly_dark', xaxis_rangeslider_visible=False)
+                            # 使用分類 x 軸，將有資料的日期緊密排列，避免空格
+                            try:
+                                fig.update_xaxes(type='category')
+                            except Exception:
+                                pass
                             st.plotly_chart(fig, use_container_width=True)
         except Exception as e:
             logger.error(f"Chart rendering error: {e}")
@@ -2276,19 +2321,29 @@ def main():
                 if price is not None:
                     try:
                         pct = None
+                        pct_str = ''
                         if prev and prev != 0:
                             pct = (price - prev) / prev
+                            pct_str = f"{pct*100:+.2f}%"
+
+                        # 決定顯示樣式
                         if pct is not None and pct >= 0.099:
-                            cols[1].markdown(f"<span style='background:#ef4444;color:#fff;padding:2px 6px;border-radius:4px'>{price:.2f}</span>", unsafe_allow_html=True)
+                            html = f"<div style='display:flex;align-items:center;gap:6px'><span style='background:#ef4444;color:#fff;padding:2px 6px;border-radius:4px'>{price:.2f}</span><span style='color:#ef4444;font-weight:600'>{pct_str}</span></div>"
+                            cols[1].markdown(html, unsafe_allow_html=True)
                         elif pct is not None and pct <= -0.099:
-                            cols[1].markdown(f"<span style='background:#10b981;color:#fff;padding:2px 6px;border-radius:4px'>{price:.2f}</span>", unsafe_allow_html=True)
+                            html = f"<div style='display:flex;align-items:center;gap:6px'><span style='background:#10b981;color:#fff;padding:2px 6px;border-radius:4px'>{price:.2f}</span><span style='color:#10b981;font-weight:600'>{pct_str}</span></div>"
+                            cols[1].markdown(html, unsafe_allow_html=True)
                         else:
                             if change is not None and change > 0:
-                                cols[1].markdown(f"<span style='color:#ef4444'>{price:.2f}</span>", unsafe_allow_html=True)
+                                html = f"<div style='display:flex;align-items:center;gap:6px'><span style='color:#ef4444'>{price:.2f}</span><span style='color:#ef4444;font-weight:600'>{pct_str}</span></div>"
+                                cols[1].markdown(html, unsafe_allow_html=True)
                             elif change is not None and change < 0:
-                                cols[1].markdown(f"<span style='color:#10b981'>{price:.2f}</span>", unsafe_allow_html=True)
+                                html = f"<div style='display:flex;align-items:center;gap:6px'><span style='color:#10b981'>{price:.2f}</span><span style='color:#10b981;font-weight:600'>{pct_str}</span></div>"
+                                cols[1].markdown(html, unsafe_allow_html=True)
                             else:
-                                cols[1].write(f"{price:.2f}")
+                                # 無明顯漲跌
+                                html = f"<div style='display:flex;align-items:center;gap:6px'><span>{price:.2f}</span>" + (f"<span style='color:#d1d5db;font-weight:600'>{pct_str}</span>" if pct_str else "") + "</div>"
+                                cols[1].markdown(html, unsafe_allow_html=True)
                     except Exception:
                         cols[1].write(f"{price:.2f}")
                 else:
@@ -2449,7 +2504,7 @@ def main():
                         st.session_state['trade_preview'] = {'input': t_symbol, 'resolved': resolved, 'price': price}
                     except Exception as e:
                         st.session_state['trade_preview'] = {'input': t_symbol, 'resolved': None, 'price': None, 'error': str(e)}
-                    st.experimental_rerun()
+                    safe_rerun()
 
                 if st.form_submit_button("準備送出"):
                     # 建立待確認交易（不立即執行）
@@ -2467,7 +2522,7 @@ def main():
                         'limit_price': float(t_price),
                         'fetched_price': price_fetched,
                     }
-                    st.experimental_rerun()
+                    safe_rerun()
 
             # 顯示交易預覽與二次確認
             pending = st.session_state.get('pending_trade')
@@ -2494,12 +2549,12 @@ def main():
                             if latest is None or latest <= 0:
                                 st.error("無法取得市價，交易取消")
                                 del st.session_state['pending_trade']
-                                st.experimental_rerun()
+                                safe_rerun()
                             use_price = latest
                         except Exception:
                             st.error("取得市價失敗，交易取消")
                             del st.session_state['pending_trade']
-                            st.experimental_rerun()
+                            safe_rerun()
 
                     try:
                         if pending.get('action') == 'buy':
@@ -2524,7 +2579,7 @@ def main():
                             del st.session_state['trade_preview']
                         except Exception:
                             pass
-                        st.experimental_rerun()
+                        safe_rerun()
 
                 if colc2.button("取消"):
                     try:
@@ -2532,7 +2587,7 @@ def main():
                     except Exception:
                         pass
                     st.info("已取消交易")
-                    st.experimental_rerun()
+                    safe_rerun()
 
             if st.button("結算所有持股"):
                 try:
@@ -2544,7 +2599,7 @@ def main():
                         # 顯示 1 秒後自動刷新以觸發淡出效果
                         time.sleep(1)
                         st.session_state.pop('just_settled', None)
-                        st.experimental_rerun()
+                        safe_rerun()
                     else:
                         st.info("沒有持股可結算")
                 except Exception as e:
@@ -2594,23 +2649,25 @@ def main():
                 price_html = ''
                 try:
                     pct = None
+                    pct_str = ''
                     if prev and prev != 0:
                         pct = (curp - prev) / prev
-                    # 判斷漲停/跌停（簡化為 >=9.9% / <=-9.9%）
+                        pct_str = f"{pct*100:+.2f}%"
+
                     if pct is not None and pct >= 0.099:
-                        price_html = f"<span style='background:#ef4444;color:#fff;padding:2px 6px;border-radius:4px'>{curp:.2f}</span>"
+                        html = f"<div style='display:flex;align-items:center;gap:6px'><span style='background:#ef4444;color:#fff;padding:2px 6px;border-radius:4px'>{curp:.2f}</span><span style='color:#ef4444;font-weight:600'>{pct_str}</span></div>"
                     elif pct is not None and pct <= -0.099:
-                        price_html = f"<span style='background:#10b981;color:#fff;padding:2px 6px;border-radius:4px'>{curp:.2f}</span>"
+                        html = f"<div style='display:flex;align-items:center;gap:6px'><span style='background:#10b981;color:#fff;padding:2px 6px;border-radius:4px'>{curp:.2f}</span><span style='color:#10b981;font-weight:600'>{pct_str}</span></div>"
                     else:
                         if change is not None and change > 0:
-                            price_html = f"<span style='color:#ef4444'>{curp:.2f}</span>"
+                            html = f"<div style='display:flex;align-items:center;gap:6px'><span style='color:#ef4444'>{curp:.2f}</span><span style='color:#ef4444;font-weight:600'>{pct_str}</span></div>"
                         elif change is not None and change < 0:
-                            price_html = f"<span style='color:#10b981'>{curp:.2f}</span>"
+                            html = f"<div style='display:flex;align-items:center;gap:6px'><span style='color:#10b981'>{curp:.2f}</span><span style='color:#10b981;font-weight:600'>{pct_str}</span></div>"
                         else:
-                            price_html = f"{curp:.2f}"
+                            html = f"<div style='display:flex;align-items:center;gap:6px'><span>{curp:.2f}</span>" + (f"<span style='color:#d1d5db;font-weight:600'>{pct_str}</span>" if pct_str else "") + "</div>"
                 except Exception:
-                    price_html = f"{curp:.2f}"
-                cols[4].markdown(price_html, unsafe_allow_html=True)
+                    html = f"{curp:.2f}"
+                cols[4].markdown(html, unsafe_allow_html=True)
 
                 # 獲利與報酬率
                 cols[5].write(f"{profit:.2f}")
