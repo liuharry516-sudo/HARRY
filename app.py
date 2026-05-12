@@ -185,6 +185,15 @@ class InviteToken(Base):
     used = Column(Boolean, default=False)
     assigned_user = Column(String(100), nullable=True)
 
+class AdminVerification(Base):
+    __tablename__ = 'admin_verifications'
+    id = Column(Integer, primary_key=True)
+    username = Column(String(100))
+    code = Column(String(20), unique=True)
+    created_at = Column(DateTime, default=datetime.datetime.now)
+    expires_at = Column(DateTime)
+    used = Column(Boolean, default=False)
+
 Base.metadata.create_all(engine)
 
 # 確保新版欄位存在（sqlite ALTER TABLE 加欄位）
@@ -2003,6 +2012,18 @@ def render_financial_wall(symbol):
 # [STAGE 4] 主介面
 # ==============================================================================
 def main():
+    # 清理過期的管理員驗證碼
+    db = get_db()
+    try:
+        expired = db.query(AdminVerification).filter(AdminVerification.expires_at < datetime.datetime.now()).all()
+        for e in expired:
+            db.delete(e)
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+    
     st.set_page_config(page_title="HARRY 股票系統", layout="wide")
     
     st.markdown("""<style>
@@ -2067,19 +2088,96 @@ def main():
             st.subheader("🔐 系統認證")
             u = st.text_input("帳號")
             p = st.text_input("密鑰", type="password")
+            
+            # 如果正在等待管理員驗證碼
+            if st.session_state.get('awaiting_admin_code'):
+                st.subheader("管理員驗證")
+                entered_code = st.text_input("請輸入發送到 yyy666001@gmail.com 的 20 位數驗證碼", type="password")
+                if st.button("驗證"):
+                    db = get_db()
+                    try:
+                        # 檢查驗證碼
+                        verif = db.query(AdminVerification).filter_by(
+                            username=st.session_state.get('admin_username'),
+                            code=entered_code,
+                            used=False
+                        ).first()
+                        if verif and datetime.datetime.now() < verif.expires_at:
+                            verif.used = True
+                            db.commit()
+                            st.session_state.logged = True
+                            st.session_state.user = st.session_state['admin_username']
+                            st.session_state.role = 'admin'
+                            st.session_state['just_logged_in'] = True
+                            st.session_state['just_logged_in_at'] = time.time()
+                            st.success("驗證成功，登入中...")
+                            # 清理
+                            del st.session_state['awaiting_admin_code']
+                            del st.session_state['admin_username']
+                            safe_rerun()
+                        else:
+                            st.error("驗證碼錯誤或已過期")
+                    except Exception as e:
+                        db.rollback()
+                        st.error(f"驗證失敗: {e}")
+                    finally:
+                        db.close()
+                if st.button("取消"):
+                    del st.session_state['awaiting_admin_code']
+                    del st.session_state['admin_username']
+                    st.info("已取消")
+                    safe_rerun()
+                return
+            
             if st.button("解鎖終端"):
                 db = get_db()
                 user = db.query(User).filter_by(username=u).first()
                 db.close()
                 
                 if user and user.is_active and verify_password(user.password, p, u):
-                    st.session_state.logged = True
-                    st.session_state.user = u
-                    st.session_state.role = user.role
-                    # 標記為剛登入以顯示歡迎動畫，稍後在 main() 處理
-                    st.session_state['just_logged_in'] = True
-                    st.session_state['just_logged_in_at'] = time.time()
-                    st.rerun()
+                    if user.role == 'admin':
+                        # 生成 20 位數亂碼
+                        import secrets
+                        code = secrets.token_hex(10)  # 20 字元
+                        expires_at = datetime.datetime.now() + datetime.timedelta(minutes=3)
+                        
+                        # 儲存到 DB
+                        db = get_db()
+                        try:
+                            db.add(AdminVerification(username=u, code=code, expires_at=expires_at))
+                            db.commit()
+                        except Exception as e:
+                            db.rollback()
+                            st.error(f"生成驗證碼失敗: {e}")
+                            db.close()
+                            return
+                        db.close()
+                        
+                        # 發送郵件
+                        smtp_cfg = load_smtp_config()
+                        if smtp_cfg:
+                            try:
+                                send_email('yyy666001@gmail.com', '管理員登入驗證碼', f'您的驗證碼是: {code}\n有效期 3 分鐘。', smtp_cfg)
+                                st.success("驗證碼已發送到 yyy666001@gmail.com")
+                            except Exception as e:
+                                st.error(f"發送郵件失敗: {e}")
+                                return
+                        else:
+                            st.error("SMTP 未配置，無法發送驗證碼")
+                            return
+                        
+                        # 設置等待驗證
+                        st.session_state['awaiting_admin_code'] = True
+                        st.session_state['admin_username'] = u
+                        st.info("請檢查郵件並輸入驗證碼")
+                        safe_rerun()
+                    else:
+                        st.session_state.logged = True
+                        st.session_state.user = u
+                        st.session_state.role = user.role
+                        st.session_state['just_logged_in'] = True
+                        st.session_state['just_logged_in_at'] = time.time()
+                        st.rerun()
                 else:
                     st.error("帳號或密碼錯誤")
             return
@@ -2803,6 +2901,6 @@ if __name__ == "__main__":
         pwd_h = hash_password("123", "harry")
         db.add(User(username="harry", password=pwd_h, role="admin"))
         db.commit()
-        logger.info("初始化超級管理員帳號: harry/0000")
+        logger.info("初始化超級管理員帳號: harry/123")
     db.close()
     main()
