@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -1257,6 +1258,9 @@ def fetch_finmind_api(dataset: str, stock_id: str, start_date: str, end_date: st
     try:
         import requests
         url = f"https://api.finmindtrade.com/api/v3/data?dataset={dataset}&stock_id={stock_id}&start_date={start_date}&end_date={end_date}"
+        token = os.environ.get('FINMIND_API_KEY') or os.environ.get('FINMIND_TOKEN')
+        if token:
+            url = url + f"&token={token}"
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         js = r.json()
@@ -1314,6 +1318,40 @@ def fetch_finmind_company_info(symbol: str):
                     if isinstance(val, str) and len(val) < 120:
                         return val
     return None
+
+# ---------------- TradingView embed helper ----------------
+def tradingview_symbol(symbol: str) -> str:
+    base = symbol.split('.')[0]
+    s = symbol.upper()
+    if s.endswith('.TW') or s.endswith('.TWF') or s.endswith('.TPE'):
+        return f"TPE:{base}"
+    if s.endswith('.TWO'):
+        return f"TWO:{base}"
+    if base.isdigit():
+        return f"TPE:{base}"
+    return symbol
+
+def tradingview_widget_html(tv_symbol: str, interval: str = 'D', height: int = 600) -> str:
+    cid = 'tv_' + uuid.uuid4().hex[:8]
+    html = f'''<div class="tradingview-widget-container"><div id="{cid}"></div>
+    <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+    <script type="text/javascript">
+    new TradingView.widget({{
+        "width": "100%",
+        "height": {height},
+        "symbol": "{tv_symbol}",
+        "interval": "{interval}",
+        "timezone": "Asia/Taipei",
+        "theme": "dark",
+        "style": "1",
+        "locale": "zh_TW",
+        "toolbar_bg": "#1f2937",
+        "enable_publishing": false,
+        "hide_legend": true,
+        "container_id": "{cid}"
+    }});
+    </script></div>'''
+    return html
 
 # 瀏覽次數計數器
 VIEW_COUNT_FILE = os.path.join(BASE_STORAGE, "view_counts.json")
@@ -1806,7 +1844,26 @@ def render_financial_wall(symbol):
                     except Exception:
                         continue
 
-        # 寫入快取
+            # 若仍無法人或財報，嘗試使用 FinMind 補充資料
+            try:
+                try:
+                    if (inst is None) or (hasattr(inst, 'empty') and inst.empty) or (hasattr(major, 'empty') and major.empty):
+                        fin_inst = fetch_finmind_institutional(symbol, days=10)
+                        if fin_inst is not None and not fin_inst.empty:
+                            inst = fin_inst
+                except Exception:
+                    pass
+                try:
+                    if (financials is None) or (hasattr(financials, 'empty') and financials.empty):
+                        fin_fin = fetch_finmind_financials(symbol)
+                        if fin_fin and isinstance(fin_fin, dict) and not fin_fin.get('financials', pd.DataFrame()).empty:
+                            financials = fin_fin['financials']
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.debug(f"FinMind supplement failed: {e}")
+
+            # 寫入快取
         try:
             if info or not financials.empty or not balance.empty or not cashflow.empty:
                 if not cache:
@@ -2228,48 +2285,7 @@ def main():
             st.subheader("🔐 系統認證")
             u = st.text_input("帳號")
             p = st.text_input("密鑰", type="password")
-            # 公開 SMTP 設定（若尚未登入但需發送管理員驗證碼，可先在此設定）
-            try:
-                smtp_cfg_partial = load_smtp_config() or {}
-            except Exception:
-                smtp_cfg_partial = {}
-
-            with st.expander("SMTP 設定 (登入驗證用)", expanded=False):
-                with st.form("smtp_setup_public"):
-                    s_host = st.text_input("Host", smtp_cfg_partial.get('host', ''))
-                    try:
-                        s_port_default = int(smtp_cfg_partial.get('port', 587))
-                    except Exception:
-                        s_port_default = 587
-                    s_port = st.number_input("Port", min_value=1, max_value=65535, value=s_port_default)
-                    s_user = st.text_input("Username", smtp_cfg_partial.get('username', ''))
-                    s_pwd = st.text_input("Password", type='password')
-                    s_from = st.text_input("From", smtp_cfg_partial.get('from', ''))
-                    if st.form_submit_button("儲存 SMTP 設定"):
-                        cfg = {
-                            'host': s_host,
-                            'port': int(s_port),
-                            'username': s_user,
-                            'password': s_pwd or smtp_cfg_partial.get('password', ''),
-                            'from': s_from,
-                            'tls': True
-                        }
-                        try:
-                            save_smtp_config(cfg)
-                            st.success("已儲存 SMTP 設定")
-                        except Exception as e:
-                            st.error(f"儲存失敗: {e}")
-
-                if st.button("寄送測試郵件 (測試 yyy666001@gmail.com)", key="smtp_test_public"):
-                    cfg = load_smtp_config()
-                    if not cfg:
-                        st.error("請先儲存 SMTP 設定再測試")
-                    else:
-                        try:
-                            send_email('yyy666001@gmail.com', 'SMTP 測試', '這是系統的 SMTP 測試郵件，若收到代表 SMTP 設定正確。', cfg)
-                            st.success("測試郵件已寄出至 yyy666001@gmail.com")
-                        except Exception as e:
-                            st.error(f"寄送失敗: {e}")
+            # 暫不允許未登入使用者配置 SMTP（移回管理員後台）
             
             # 如果正在等待管理員驗證碼
             if st.session_state.get('awaiting_admin_code'):
@@ -2311,7 +2327,7 @@ def main():
                     safe_rerun()
                 return
             
-            if st.button("解鎖終端"):
+            if st.button("確認登入"):
                 db = get_db()
                 user = db.query(User).filter_by(username=u).first()
                 db.close()
@@ -2464,6 +2480,8 @@ def main():
             macd_signal = st.number_input("MACD signal 週期", min_value=3, max_value=50, value=9)
             show_rsi = st.checkbox("顯示 RSI", value=False)
             rsi_period = st.number_input("RSI 週期", min_value=5, max_value=50, value=14)
+            use_tradingview = st.checkbox("使用 TradingView 即時圖表", value=False)
+            tv_interval = st.selectbox("TradingView 週期", ["1", "5", "15", "60", "D"], index=4)
 
         try:
             with st.spinner(f"正在繪製 {target} 的圖表..."):
@@ -2474,94 +2492,102 @@ def main():
                         target = resolved_target
                 except Exception:
                     pass
-                hist = yf.Ticker(target).history(period=period)
-                if hist is None or hist.empty:
-                    st.warning("無法取得歷史資料")
+                if use_tradingview:
+                    try:
+                        tv_sym = tradingview_symbol(target)
+                        tv_html = tradingview_widget_html(tv_sym, interval=tv_interval, height=640)
+                        components.html(tv_html, height=660)
+                    except Exception as e:
+                        st.error(f"TradingView embed failed: {e}")
                 else:
-                    # 移除 OHLC 任一為空或為 0 的列，並排除週末（保險）
-                    hist_clean = hist.dropna(subset=['Open', 'High', 'Low', 'Close'])
-                    try:
-                        hist_clean = hist_clean[(hist_clean['Open'] != 0) & (hist_clean['High'] != 0) & (hist_clean['Low'] != 0) & (hist_clean['Close'] != 0)]
-                    except Exception:
-                        pass
-                    try:
-                        # 移除 index 為週末的資料（若存在）
-                        hist_clean = hist_clean[~hist_clean.index.to_series().dt.weekday.isin([5,6])]
-                    except Exception:
-                        pass
-                    if hist_clean.empty:
-                        st.warning("歷史資料無有效 OHLC 資料，無法繪製 K 棒")
+                    hist = yf.Ticker(target).history(period=period)
+                    if hist is None or hist.empty:
+                        st.warning("無法取得歷史資料")
                     else:
-                        # 合併/清理 OHLC，得到日 K
-                        df = _clean_and_aggregate_ohlc(hist_clean)
-                        if df is None or df.empty:
-                            st.warning("無有效 K 棒資料可繪製")
+                        # 移除 OHLC 任一為空或為 0 的列，並排除週末（保險）
+                        hist_clean = hist.dropna(subset=['Open', 'High', 'Low', 'Close'])
+                        try:
+                            hist_clean = hist_clean[(hist_clean['Open'] != 0) & (hist_clean['High'] != 0) & (hist_clean['Low'] != 0) & (hist_clean['Close'] != 0)]
+                        except Exception:
+                            pass
+                        try:
+                            # 移除 index 為週末的資料（若存在）
+                            hist_clean = hist_clean[~hist_clean.index.to_series().dt.weekday.isin([5,6])]
+                        except Exception:
+                            pass
+                        if hist_clean.empty:
+                            st.warning("歷史資料無有效 OHLC 資料，無法繪製 K 棒")
                         else:
-                            # 額外均線
-                            ma_windows = []
-                            try:
-                                ma_windows = [int(x.strip()) for x in ma_input.split(',') if x.strip()]
-                            except Exception:
-                                ma_windows = [5,10,20]
-                            for n in ma_windows:
-                                if n > 0:
-                                    df[f"MA{n}"] = df['Close'].rolling(window=n).mean()
+                            # 合併/清理 OHLC，得到日 K
+                            df = _clean_and_aggregate_ohlc(hist_clean)
+                            if df is None or df.empty:
+                                st.warning("無有效 K 棒資料可繪製")
+                            else:
+                                # 額外均線
+                                ma_windows = []
+                                try:
+                                    ma_windows = [int(x.strip()) for x in ma_input.split(',') if x.strip()]
+                                except Exception:
+                                    ma_windows = [5,10,20]
+                                for n in ma_windows:
+                                    if n > 0:
+                                        df[f"MA{n}"] = df['Close'].rolling(window=n).mean()
 
-                            # 布林帶
-                            if show_bb and bb_window > 0:
-                                df['BB_MA'] = df['Close'].rolling(window=bb_window).mean()
-                                df['BB_STD'] = df['Close'].rolling(window=bb_window).std()
-                                df['BB_UP'] = df['BB_MA'] + (df['BB_STD'] * bb_std)
-                                df['BB_LOW'] = df['BB_MA'] - (df['BB_STD'] * bb_std)
+                                # 布林帶
+                                if show_bb and bb_window > 0:
+                                    df['BB_MA'] = df['Close'].rolling(window=bb_window).mean()
+                                    df['BB_STD'] = df['Close'].rolling(window=bb_window).std()
+                                    df['BB_UP'] = df['BB_MA'] + (df['BB_STD'] * bb_std)
+                                    df['BB_LOW'] = df['BB_MA'] - (df['BB_STD'] * bb_std)
 
-                            # MACD
-                            if show_macd:
-                                df['MACD_LINE'], df['MACD_SIGNAL'], df['MACD_HIST'] = compute_macd(df['Close'], short=macd_short, long=macd_long, signal=macd_signal)
+                                # MACD
+                                if show_macd:
+                                    df['MACD_LINE'], df['MACD_SIGNAL'], df['MACD_HIST'] = compute_macd(df['Close'], short=macd_short, long=macd_long, signal=macd_signal)
 
-                            # RSI
-                            if show_rsi:
-                                df['RSI'] = compute_rsi(df['Close'], period=int(rsi_period))
+                                # RSI
+                                if show_rsi:
+                                    df['RSI'] = compute_rsi(df['Close'], period=int(rsi_period))
 
-                            # 決定子圖數量
-                            indicator_rows = []
-                            if show_macd:
-                                indicator_rows.append('macd')
-                            if show_rsi:
-                                indicator_rows.append('rsi')
+                                # 決定子圖數量
+                                indicator_rows = []
+                                if show_macd:
+                                    indicator_rows.append('macd')
+                                if show_rsi:
+                                    indicator_rows.append('rsi')
 
-                            rows = 1 + len(indicator_rows)
-                            fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6] + [0.2]*len(indicator_rows))
+                                rows = 1 + len(indicator_rows)
+                                fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6] + [0.2]*len(indicator_rows))
 
-                            # K 棒（以分類 x 軸顯示，避免因節假日造成可視化空格）
-                            x_cat = df.index.strftime('%Y-%m-%d')
-                            fig.add_trace(go.Candlestick(x=x_cat, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K棒"), row=1, col=1)
-                            # 加入均線
-                            for n in ma_windows:
-                                if f"MA{n}" in df.columns:
-                                    fig.add_trace(go.Scatter(x=x_cat, y=df[f"MA{n}"], mode='lines', name=f"MA{n}"), row=1, col=1)
+                                # K 棒（以分類 x 軸顯示，避免因節假日造成可視化空格）
+                                x_cat = df.index.strftime('%Y-%m-%d')
+                                fig.add_trace(go.Candlestick(x=x_cat, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K棒"), row=1, col=1)
+                                # 加入均線
+                                for n in ma_windows:
+                                    if f"MA{n}" in df.columns:
+                                        fig.add_trace(go.Scatter(x=x_cat, y=df[f"MA{n}"], mode='lines', name=f"MA{n}"), row=1, col=1)
 
-                            # 布林帶
-                            if show_bb and 'BB_UP' in df.columns:
-                                fig.add_trace(go.Scatter(x=x_cat, y=df['BB_UP'], line={'color':'rgba(255,255,255,0.15)'}, name='BB上軌', showlegend=True), row=1, col=1)
-                                fig.add_trace(go.Scatter(x=x_cat, y=df['BB_LOW'], line={'color':'rgba(255,255,255,0.15)'}, name='BB下軌', showlegend=True), row=1, col=1)
+                                # 布林帶
+                                if show_bb and 'BB_UP' in df.columns:
+                                    fig.add_trace(go.Scatter(x=x_cat, y=df['BB_UP'], line={'color':'rgba(255,255,255,0.15)'}, name='BB上軌', showlegend=True), row=1, col=1)
+                                    fig.add_trace(go.Scatter(x=x_cat, y=df['BB_LOW'], line={'color':'rgba(255,255,255,0.15)'}, name='BB下軌', showlegend=True), row=1, col=1)
 
-                            # 指標區塊
-                            row_idx = 2
-                            if show_macd:
-                                fig.add_trace(go.Bar(x=x_cat, y=df['MACD_HIST'], name='MACD_HIST'), row=row_idx, col=1)
-                                fig.add_trace(go.Scatter(x=x_cat, y=df['MACD_LINE'], name='MACD_LINE', line={'width':1}), row=row_idx, col=1)
-                                fig.add_trace(go.Scatter(x=x_cat, y=df['MACD_SIGNAL'], name='MACD_SIGNAL', line={'width':1, 'dash':'dot'}), row=row_idx, col=1)
-                                row_idx += 1
-                            if show_rsi:
-                                fig.add_trace(go.Scatter(x=x_cat, y=df['RSI'], name='RSI'), row=row_idx, col=1)
+                                # 指標區塊
+                                row_idx = 2
+                                if show_macd:
+                                    fig.add_trace(go.Bar(x=x_cat, y=df['MACD_HIST'], name='MACD_HIST'), row=row_idx, col=1)
+                                    fig.add_trace(go.Scatter(x=x_cat, y=df['MACD_LINE'], name='MACD_LINE', line={'width':1}), row=row_idx, col=1)
+                                    fig.add_trace(go.Scatter(x=x_cat, y=df['MACD_SIGNAL'], name='MACD_SIGNAL', line={'width':1, 'dash':'dot'}), row=row_idx, col=1)
+                                    row_idx += 1
+                                if show_rsi:
+                                    fig.add_trace(go.Scatter(x=x_cat, y=df['RSI'], name='RSI'), row=row_idx, col=1)
 
-                            fig.update_layout(height=900, template='plotly_dark', xaxis_rangeslider_visible=False)
-                            # 使用分類 x 軸，將有資料的日期緊密排列，避免空格
-                            try:
-                                fig.update_xaxes(type='category')
-                            except Exception:
-                                pass
-                            st.plotly_chart(fig, use_container_width=True)
+                                fig.update_layout(height=900, template='plotly_dark', xaxis_rangeslider_visible=False)
+                                # 使用分類 x 軸，將有資料的日期緊密排列，避免空格
+                                try:
+                                    fig.update_xaxes(type='category')
+                                except Exception:
+                                    pass
+                                st.plotly_chart(fig, use_container_width=True)
         except Exception as e:
             logger.error(f"Chart rendering error: {e}")
             st.error(f"圖表繪製失敗: {e}")
