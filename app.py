@@ -2803,6 +2803,6 @@ if __name__ == "__main__":
         pwd_h = hash_password("123", "harry")
         db.add(User(username="harry", password=pwd_h, role="admin"))
         db.commit()
-        logger.info("初始化超級管理員帳號: harry/123")
+        logger.info("初始化超級管理員帳號: harry/0000")
     db.close()
     main()
