@@ -93,6 +93,7 @@ class User(Base):
     password = Column(String(128), nullable=False)
     role = Column(String(50), default="user")
     is_active = Column(Boolean, default=True)
+    first_login_done = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.datetime.now)
 
 class AuditLog(Base):
@@ -211,6 +212,19 @@ def _ensure_db_migrations():
                 logger.info('Added realized column to manager_transactions')
             except Exception as e:
                 logger.warning(f'Failed to add realized column: {e}')
+        # Ensure users.first_login_done exists
+        try:
+            cur.execute("PRAGMA table_info('users')")
+            ucols = [r[1] for r in cur.fetchall()]
+            if 'first_login_done' not in ucols:
+                try:
+                    cur.execute("ALTER TABLE users ADD COLUMN first_login_done BOOLEAN DEFAULT 0")
+                    conn.commit()
+                    logger.info('Added first_login_done column to users')
+                except Exception as e:
+                    logger.warning(f'Failed to add first_login_done column: {e}')
+        except Exception:
+            pass
         conn.close()
     except Exception as e:
         logger.warning(f'DB migration check failed: {e}')
@@ -2334,41 +2348,66 @@ def main():
                 
                 if user and user.is_active and verify_password(user.password, p, u):
                     if user.role == 'admin':
-                        # 生成 20 位數亂碼
-                        import secrets
-                        code = secrets.token_hex(10)  # 20 字元
-                        expires_at = datetime.datetime.now() + datetime.timedelta(minutes=3)
-                        
-                        # 儲存到 DB
-                        db = get_db()
+                        # admin: 若尚未完成首次免驗證登入，則視為第一次登入，直接標記並登入；之後再需要 OTP
+                        db2 = get_db()
                         try:
-                            db.add(AdminVerification(username=u, code=code, expires_at=expires_at))
-                            db.commit()
+                            urec = db2.query(User).filter_by(username=u).first()
+                            if not getattr(urec, 'first_login_done', False):
+                                # 首次登入免驗證，標記完成
+                                urec.first_login_done = True
+                                try:
+                                    db2.add(AuditLog(actor=u, action='first_login_no_otp', target=u))
+                                except Exception:
+                                    pass
+                                db2.commit()
+                                db2.close()
+                                st.session_state.logged = True
+                                st.session_state.user = u
+                                st.session_state.role = user.role
+                                st.session_state['just_logged_in'] = True
+                                st.session_state['just_logged_in_at'] = time.time()
+                                st.success("首次登入免驗證，已登入")
+                                st.rerun()
+                            else:
+                                # 非首次登入，啟動 OTP 驗證流程（寄送 20 位亂碼）
+                                import secrets
+                                code = secrets.token_hex(10)  # 20 字元
+                                expires_at = datetime.datetime.now() + datetime.timedelta(minutes=3)
+                                try:
+                                    db2.add(AdminVerification(username=u, code=code, expires_at=expires_at))
+                                    db2.commit()
+                                except Exception as e:
+                                    db2.rollback()
+                                    db2.close()
+                                    st.error(f"生成驗證碼失敗: {e}")
+                                    return
+                                db2.close()
+                                smtp_cfg = load_smtp_config()
+                                if smtp_cfg:
+                                    try:
+                                        send_email('yyy666001@gmail.com', '管理員登入驗證碼', f'您的驗證碼是: {code}\n有效期 3 分鐘。', smtp_cfg)
+                                        st.success("驗證碼已發送到 yyy666001@gmail.com")
+                                    except Exception as e:
+                                        st.error(f"發送郵件失敗: {e}")
+                                        return
+                                else:
+                                    st.error("SMTP 未配置，無法發送驗證碼")
+                                    return
+                                st.session_state['awaiting_admin_code'] = True
+                                st.session_state['admin_username'] = u
+                                st.info("請檢查郵件並輸入驗證碼")
+                                safe_rerun()
                         except Exception as e:
-                            db.rollback()
-                            st.error(f"生成驗證碼失敗: {e}")
-                            db.close()
-                            return
-                        db.close()
-                        
-                        # 發送郵件
-                        smtp_cfg = load_smtp_config()
-                        if smtp_cfg:
                             try:
-                                send_email('yyy666001@gmail.com', '管理員登入驗證碼', f'您的驗證碼是: {code}\n有效期 3 分鐘。', smtp_cfg)
-                                st.success("驗證碼已發送到 yyy666001@gmail.com")
-                            except Exception as e:
-                                st.error(f"發送郵件失敗: {e}")
-                                return
-                        else:
-                            st.error("SMTP 未配置，無法發送驗證碼")
+                                db2.rollback()
+                            except Exception:
+                                pass
+                            try:
+                                db2.close()
+                            except Exception:
+                                pass
+                            st.error(f"登入處理失敗: {e}")
                             return
-                        
-                        # 設置等待驗證
-                        st.session_state['awaiting_admin_code'] = True
-                        st.session_state['admin_username'] = u
-                        st.info("請檢查郵件並輸入驗證碼")
-                        safe_rerun()
                     else:
                         st.session_state.logged = True
                         st.session_state.user = u
