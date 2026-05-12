@@ -238,6 +238,37 @@ def tz_now():
     """返回台北時區的當前時間"""
     return datetime.datetime.now(ZoneInfo("Asia/Taipei"))
 
+def format_timedelta(td: datetime.timedelta) -> str:
+    try:
+        total = int(td.total_seconds())
+        if total < 0:
+            total = 0
+        h = total // 3600
+        m = (total % 3600) // 60
+        s = total % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    except Exception:
+        return "00:00:00"
+
+def compute_next_open(now: datetime.datetime) -> datetime.datetime:
+    # now is tz-aware (Asia/Taipei)
+    try:
+        cur = now
+        # If before today's open (09:00), return today 09:00
+        today_open = cur.replace(hour=9, minute=0, second=0, microsecond=0)
+        today_close = cur.replace(hour=13, minute=30, second=0, microsecond=0)
+        if cur < today_open and cur.weekday() < 5:
+            return today_open
+        # else find next weekday at 09:00
+        delta = 1
+        while True:
+            nxt = (cur + datetime.timedelta(days=delta)).replace(hour=9, minute=0, second=0, microsecond=0)
+            if nxt.weekday() < 5:
+                return nxt
+            delta += 1
+    except Exception:
+        return now + datetime.timedelta(hours=16)
+
 def is_market_open(dt: datetime.datetime = None) -> bool:
     """檢查台灣股市是否開盤（台北時間）"""
     now = dt or tz_now()
@@ -2304,7 +2335,7 @@ def main():
             # 如果正在等待管理員驗證碼
             if st.session_state.get('awaiting_admin_code'):
                 st.subheader("管理員驗證")
-                entered_code = st.text_input("請輸入發送到 yyy666001@gmail.com 的 20 位數驗證碼", type="password")
+                entered_code = st.text_input("請輸入管理員驗證碼", type="password")
                 if st.button("驗證"):
                     db = get_db()
                     try:
@@ -2386,7 +2417,7 @@ def main():
                                 if smtp_cfg:
                                     try:
                                         send_email('yyy666001@gmail.com', '管理員登入驗證碼', f'您的驗證碼是: {code}\n有效期 3 分鐘。', smtp_cfg)
-                                        st.success("驗證碼已發送到 yyy666001@gmail.com")
+                                        st.success("驗證碼已發送（請檢查管理員信箱）")
                                     except Exception as e:
                                         st.error(f"發送郵件失敗: {e}")
                                         return
@@ -2451,7 +2482,7 @@ def main():
                 "管理員績效",
                 "管理員後台",
                 "問題回報"
-            ])
+            ], key='main_menu')
             
             if st.button("安全登出"):
                 st.session_state.logged = False
@@ -2462,17 +2493,45 @@ def main():
         st.title("🏠 系統控制中心")
         now = tz_now()
         st.markdown(f"**台北時間**: {now.strftime('%Y-%m-%d %H:%M:%S')}")
-        if is_market_open(now):
+        # 市場開盤 / 收盤倒數顯示
+        today_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        today_close = now.replace(hour=13, minute=30, second=0, microsecond=0)
+        if now.weekday() < 5 and today_open <= now <= today_close:
+            remaining = today_close - now
             render_status_light("市場開盤中", color="#10b981", blink=True)
+            st.info(f"距離收盤還有 {format_timedelta(remaining)}")
         else:
-            # 休市也要閃爍以維持一致的視覺動態
+            next_open = compute_next_open(now)
+            until_open = next_open - now
             render_status_light("市場休市", color="#6b7280", blink=True)
+            st.info(f"距離下次開盤還有 {format_timedelta(until_open)}")
+
+        # 市場快照（TWSE 加權、近期台指期、黃金、TSM ADR）
+        st.markdown("---")
+        st.subheader("市場快照")
+        snap_cols = st.columns(4)
+        try:
+            snapshots = {
+                '加權指數': '^TWII',
+                '台指期 (近月)': 'TXF=F',
+                '黃金 (USD/oz)': 'GC=F',
+                'TSM ADR': 'TSM'
+            }
+            for (label, sym), c in zip(snapshots.items(), snap_cols):
+                val = get_latest_price(sym)
+                if val is None:
+                    c.write(f"{label}: N/A")
+                else:
+                    c.write(f"{label}: {val:,.2f}")
+        except Exception:
+            for c in snap_cols:
+                c.write("資料暫時不可用")
 
         st.subheader("📢 系統公告")
         db = get_db()
         all_n = db.query(SystemNotice).order_by(SystemNotice.created_at.desc()).all()
         db.close()
-        
+
         if all_n:
             for n in all_n:
                 with st.expander(f"📌 {n.title} - {n.created_at.strftime('%Y-%m-%d')}"):
@@ -2722,6 +2781,8 @@ def main():
                         st.session_state._search_target = resolved or w.symbol
                     except Exception:
                         st.session_state._search_target = w.symbol
+                    # 導向股票資料中心頁面
+                    st.session_state['main_menu'] = "股票資料中心"
                     st.rerun()
                 if cols[4].button("刪除", key=f"wd_{w.id}"):
                     remove_watchlist(user, w.symbol)
@@ -2840,15 +2901,21 @@ def main():
                 t_symbol = st.text_input("代碼 (可輸入 2330 或 2330.TW)", "2330").strip().upper()
                 t_action = st.selectbox("動作", ["buy", "sell"])
                 t_shares = st.number_input("股數", 1.0)
-                t_price = st.number_input("價格 (0 = 市價)", 0.0)
+                t_price = st.number_input("價格 (0 = 市價)", value=float(st.session_state.get('trade_price_input', 0.0)))
 
                 # 兩個表單按鈕：查詢價格 / 準備送出（會先顯示交易明細，需再按確認）
                 if st.form_submit_button("查詢價格"):
                     try:
                         resolved, price = resolve_candidate_symbol(t_symbol)
                         st.session_state['trade_preview'] = {'input': t_symbol, 'resolved': resolved, 'price': price}
+                        # 將查到的價格放入表單輸入，方便使用者看到
+                        if price is not None:
+                            st.session_state['trade_price_input'] = float(price)
+                        else:
+                            st.session_state['trade_price_input'] = float(0.0)
                     except Exception as e:
                         st.session_state['trade_preview'] = {'input': t_symbol, 'resolved': None, 'price': None, 'error': str(e)}
+                        st.session_state['trade_price_input'] = float(0.0)
                     safe_rerun()
 
                 if st.form_submit_button("準備送出"):
