@@ -1124,6 +1124,17 @@ def get_company_display(symbol: str) -> str:
             pass
 
     # 快速嘗試從 yfinance 抓一次（輕量）
+    # 先嘗試 FinMind 取得公司資訊（若可用）
+    try:
+        try:
+            fin_name = fetch_finmind_company_info(symbol)
+            if fin_name:
+                return f"{fin_name} {base}"
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     try:
         info, *_ = safe_ticker_fetch(symbol, retries=1, backoff=0.5)
         if info and isinstance(info, dict):
@@ -1240,6 +1251,109 @@ def round_half_up(n, ndigits=2):
     except Exception:
         return float(Decimal(n).quantize(exp, rounding=ROUND_HALF_UP))
 
+# ------------------- FinMind + 觀看次數 支援函式 -------------------
+def fetch_finmind_api(dataset: str, stock_id: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """通用 FinMind API 呼叫（若成功回傳 DataFrame，否則回傳空 DataFrame）。"""
+    try:
+        import requests
+        url = f"https://api.finmindtrade.com/api/v3/data?dataset={dataset}&stock_id={stock_id}&start_date={start_date}&end_date={end_date}"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        js = r.json()
+        data = js.get('data') if isinstance(js, dict) else None
+        if data:
+            return pd.DataFrame(data)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def fetch_finmind_institutional(symbol: str, days: int = 10) -> pd.DataFrame:
+    base = symbol.split('.')[0].upper()
+    end = tz_now().strftime('%Y-%m-%d')
+    start = (tz_now() - datetime.timedelta(days=max(7, days * 2))).strftime('%Y-%m-%d')
+    datasets = ['TaiwanStockInstitutionalInvestorsBuySell', 'TaiwanStockInstitutionalInvestors']
+    for ds in datasets:
+        df = fetch_finmind_api(ds, base, start, end)
+        if not df.empty:
+            return df
+    return pd.DataFrame()
+
+def fetch_finmind_financials(symbol: str):
+    base = symbol.split('.')[0].upper()
+    end = tz_now().strftime('%Y-%m-%d')
+    start = (tz_now() - datetime.timedelta(days=365 * 3)).strftime('%Y-%m-%d')
+    datasets = [
+        'TaiwanStockFinancialStatements',
+        'TaiwanStockFinancialStatementsQuarterly',
+        'TaiwanStockFinancialReport',
+        'FinancialStatements',
+        'FinancialStatementsQuarterly'
+    ]
+    results = {'financials': pd.DataFrame(), 'balance': pd.DataFrame(), 'cashflow': pd.DataFrame(), 'errors': []}
+    for ds in datasets:
+        df = fetch_finmind_api(ds, base, start, end)
+        if df is not None and not df.empty:
+            results['financials'] = df
+            return results
+    return results
+
+def fetch_finmind_company_info(symbol: str):
+    base = symbol.split('.')[0].upper()
+    end = tz_now().strftime('%Y-%m-%d')
+    start = (tz_now() - datetime.timedelta(days=365)).strftime('%Y-%m-%d')
+    datasets = ['TaiwanStockInfo', 'TaiwanStockCompany', 'TaiwanStockListing']
+    for ds in datasets:
+        df = fetch_finmind_api(ds, base, start, end)
+        if not df.empty:
+            for col in ('company_name', 'short_name', 'full_name', 'name', 'Company', 'company'):
+                if col in df.columns:
+                    return df.iloc[0].get(col)
+            for c in df.columns:
+                if df[c].dtype == object:
+                    val = df.iloc[0].get(c)
+                    if isinstance(val, str) and len(val) < 120:
+                        return val
+    return None
+
+# 瀏覽次數計數器
+VIEW_COUNT_FILE = os.path.join(BASE_STORAGE, "view_counts.json")
+
+def _load_view_counts():
+    try:
+        if os.path.exists(VIEW_COUNT_FILE):
+            with open(VIEW_COUNT_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def increment_view_count():
+    try:
+        counts = _load_view_counts()
+        today = tz_now().date().isoformat()
+        counts[today] = int(counts.get(today, 0)) + 1
+        with open(VIEW_COUNT_FILE, 'w', encoding='utf-8') as f:
+            json.dump(counts, f)
+        return counts[today]
+    except Exception:
+        return 0
+
+def get_today_views():
+    counts = _load_view_counts()
+    return int(counts.get(tz_now().date().isoformat(), 0))
+
+def render_view_counter():
+    try:
+        count = get_today_views()
+        html = f"""
+        <div style='position:fixed;left:12px;bottom:12px;z-index:9999;background:rgba(0,0,0,0.6);color:#fff;padding:6px 10px;border-radius:8px;font-size:13px'>今日瀏覽: {count} 次</div>
+        """
+        st.markdown(html, unsafe_allow_html=True)
+    except Exception:
+        pass
+
+# ------------------------------------------------------------------
+
 def try_fetch_three_major_flow(symbol: str, days: int = 10):
     """嘗試從 Yahoo（台股頁面或 finance.yahoo.com）抓三大法人買賣超表格。
     回傳 (DataFrame, message)。若無法取得則回傳空 DataFrame 與原因說明。
@@ -1256,6 +1370,13 @@ def try_fetch_three_major_flow(symbol: str, days: int = 10):
         candidates = [base + '.TW', base + '.TWO', base]
     else:
         candidates = [s]
+    # 優先嘗試 FinMind API（若可用）以取得三大法人買賣超
+    try:
+        fin_df = fetch_finmind_institutional(base, days=days)
+        if fin_df is not None and not fin_df.empty:
+            return fin_df, '從 FinMind API 取得法人資料'
+    except Exception:
+        pass
 
     urls = []
     for cand in candidates:
@@ -1286,6 +1407,14 @@ def fetch_financials_via_web(symbol: str):
     """嘗試從 Yahoo Finance 網頁抓取財務報表表格（損益表、資產負債表、現金流量表）。
     注意：Yahoo 使用動態載入，讀取可能失敗；此函式會嘗試用 pandas.read_html 解析。"""
     results = {'financials': pd.DataFrame(), 'balance': pd.DataFrame(), 'cashflow': pd.DataFrame(), 'errors': []}
+    # 優先嘗試使用 FinMind API 取得財報資料
+    try:
+        fm_res = fetch_finmind_financials(symbol)
+        if fm_res and isinstance(fm_res, dict) and not fm_res.get('financials', pd.DataFrame()).empty:
+            results.update(fm_res)
+            return results
+    except Exception:
+        pass
     try:
         import requests
     except Exception:
@@ -2023,6 +2152,11 @@ def main():
         db.rollback()
     finally:
         db.close()
+    # 記錄今日瀏覽次數
+    try:
+        increment_view_count()
+    except Exception:
+        pass
     
     st.set_page_config(page_title="HARRY 股票系統", layout="wide")
     
@@ -2045,6 +2179,12 @@ def main():
         .login-light { width:16px; height:16px; border-radius:50%; background:#fff; box-shadow:0 0 10px rgba(255,255,255,0.6); animation: harry-blinker 0.8s linear infinite; }
 
     </style>""", unsafe_allow_html=True)
+
+    # 顯示頁面左下瀏覽次數
+    try:
+        render_view_counter()
+    except Exception:
+        pass
 
     # 登入成功歡迎動畫（若剛登入）
     if st.session_state.get('just_logged_in'):
@@ -2088,6 +2228,48 @@ def main():
             st.subheader("🔐 系統認證")
             u = st.text_input("帳號")
             p = st.text_input("密鑰", type="password")
+            # 公開 SMTP 設定（若尚未登入但需發送管理員驗證碼，可先在此設定）
+            try:
+                smtp_cfg_partial = load_smtp_config() or {}
+            except Exception:
+                smtp_cfg_partial = {}
+
+            with st.expander("SMTP 設定 (登入驗證用)", expanded=False):
+                with st.form("smtp_setup_public"):
+                    s_host = st.text_input("Host", smtp_cfg_partial.get('host', ''))
+                    try:
+                        s_port_default = int(smtp_cfg_partial.get('port', 587))
+                    except Exception:
+                        s_port_default = 587
+                    s_port = st.number_input("Port", min_value=1, max_value=65535, value=s_port_default)
+                    s_user = st.text_input("Username", smtp_cfg_partial.get('username', ''))
+                    s_pwd = st.text_input("Password", type='password')
+                    s_from = st.text_input("From", smtp_cfg_partial.get('from', ''))
+                    if st.form_submit_button("儲存 SMTP 設定"):
+                        cfg = {
+                            'host': s_host,
+                            'port': int(s_port),
+                            'username': s_user,
+                            'password': s_pwd or smtp_cfg_partial.get('password', ''),
+                            'from': s_from,
+                            'tls': True
+                        }
+                        try:
+                            save_smtp_config(cfg)
+                            st.success("已儲存 SMTP 設定")
+                        except Exception as e:
+                            st.error(f"儲存失敗: {e}")
+
+                if st.button("寄送測試郵件 (測試 yyy666001@gmail.com)", key="smtp_test_public"):
+                    cfg = load_smtp_config()
+                    if not cfg:
+                        st.error("請先儲存 SMTP 設定再測試")
+                    else:
+                        try:
+                            send_email('yyy666001@gmail.com', 'SMTP 測試', '這是系統的 SMTP 測試郵件，若收到代表 SMTP 設定正確。', cfg)
+                            st.success("測試郵件已寄出至 yyy666001@gmail.com")
+                        except Exception as e:
+                            st.error(f"寄送失敗: {e}")
             
             # 如果正在等待管理員驗證碼
             if st.session_state.get('awaiting_admin_code'):
