@@ -1,5 +1,4 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -73,8 +72,103 @@ def get_app_secret():
 APP_SECRET = get_app_secret()
 
 DB_ABS_PATH = os.path.join(BASE_STORAGE, "HARRY_SUPREME_V13.db")
-engine = create_engine(f"sqlite:///{DB_ABS_PATH}", connect_args={"check_same_thread": False})
+
+# 為了降低啟動時因檔案環境或鎖定造成的 OperationalError，採用安全初始化流程
+import tempfile
+import traceback
+from sqlalchemy.exc import OperationalError as SAOperationalError
+from sqlalchemy.pool import StaticPool
+
 Base = declarative_base()
+
+def _safe_init_db(desired_path: str):
+    """嘗試以多重策略建立 sqlite engine：
+    1) 目標檔案路徑
+    2) 重試數次以處理短暫鎖定
+    3) /tmp 路徑備援
+    4) 記憶體資料庫（最後手段，非永續）
+    回傳 (engine, used_path)
+    """
+    def _try_touch(path):
+        d = os.path.dirname(path)
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"Could not ensure directory {d}: {e}")
+        try:
+            conn = sqlite3.connect(path, timeout=30)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL;")
+            except Exception:
+                pass
+            conn.close()
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to touch sqlite file {path}: {e}")
+            return False
+
+    def _make_engine(path):
+        eng = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False, "timeout": 30}, pool_pre_ping=True)
+        # 驗證基本連線
+        with eng.connect() as conn:
+            conn.execute("SELECT 1")
+        return eng
+
+    # 1) 預設路徑
+    try:
+        if _try_touch(desired_path):
+            try:
+                eng = _make_engine(desired_path)
+                return eng, desired_path
+            except SAOperationalError as e:
+                logger.warning(f"OperationalError on desired DB path {desired_path}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to create engine at desired path {desired_path}: {e}")
+    except Exception:
+        logger.exception("Unexpected error while initializing DB at desired path")
+
+    # 2) 重試數次應對短暫鎖定
+    for attempt in range(3):
+        try:
+            time.sleep(1 * (2 ** attempt))
+            if _try_touch(desired_path):
+                eng = _make_engine(desired_path)
+                return eng, desired_path
+        except SAOperationalError:
+            logger.warning("Retrying due to OperationalError (possibly locked DB)...")
+            continue
+        except Exception:
+            break
+
+    # 3) /tmp 備援
+    tmp_path = os.path.join(tempfile.gettempdir(), os.path.basename(desired_path))
+    try:
+        if _try_touch(tmp_path):
+            try:
+                eng = _make_engine(tmp_path)
+                logger.warning(f"Falling back to tmp DB at {tmp_path}")
+                return eng, tmp_path
+            except Exception:
+                logger.exception("Failed to create engine at tmp path")
+    except Exception:
+        logger.exception("Unexpected error while initializing DB at tmp path")
+
+    # 4) 記憶體備援（非持久化）
+    try:
+        eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        logger.critical("Falling back to in-memory SQLite DB (non-persistent)")
+        return eng, ":memory:"
+    except Exception:
+        logger.exception("All DB initialization strategies failed")
+        raise
+
+
+# 初始化 engine（並回寫實際使用路徑到 DB_ABS_PATH）
+try:
+    engine, DB_ABS_PATH = _safe_init_db(DB_ABS_PATH)
+except Exception:
+    logger.critical("Unable to initialize database engine; aborting startup", exc_info=True)
+    raise
 
 # ==============================================================================
 # [BUGFIX] 移除 scoped_session，改用普通 sessionmaker + 每次請求建立新 session
@@ -93,7 +187,6 @@ class User(Base):
     password = Column(String(128), nullable=False)
     role = Column(String(50), default="user")
     is_active = Column(Boolean, default=True)
-    first_login_done = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.datetime.now)
 
 class AuditLog(Base):
@@ -186,20 +279,48 @@ class InviteToken(Base):
     expires_at = Column(DateTime, nullable=True)
     used = Column(Boolean, default=False)
     assigned_user = Column(String(100), nullable=True)
+    assigned_user = Column(String(100), nullable=True)
 
-class AdminVerification(Base):
-    __tablename__ = 'admin_verifications'
-    id = Column(Integer, primary_key=True)
-    username = Column(String(100))
-    code = Column(String(20), unique=True)
-    created_at = Column(DateTime, default=datetime.datetime.now)
-    expires_at = Column(DateTime)
-    used = Column(Boolean, default=False)
 
-Base.metadata.create_all(engine)
+def _create_all_tables_with_retry(engine, max_retries=3):
+    for attempt in range(1, max_retries + 1):
+        try:
+            Base.metadata.create_all(engine)
+            logger.info(f"Database tables created/verified using {DB_ABS_PATH}")
+            return
+        except SAOperationalError as e:
+            msg = str(e).lower()
+            logger.warning(f"OperationalError during create_all (attempt {attempt}): {e}")
+            if 'locked' in msg or 'database is locked' in msg:
+                time.sleep(1 * (2 ** (attempt - 1)))
+                continue
+            else:
+                raise
+        except Exception:
+            logger.exception('Unexpected error when creating tables')
+            raise
+
+
+try:
+    _create_all_tables_with_retry(engine)
+except Exception:
+    # 嘗試使用 sqlite3 先建立空檔案後重試，僅在非記憶體 DB 時執行
+    if DB_ABS_PATH != ':memory:':
+        try:
+            conn = sqlite3.connect(DB_ABS_PATH, timeout=30)
+            conn.close()
+            _create_all_tables_with_retry(engine)
+        except Exception:
+            logger.exception('Failed to create tables after fallback; continuing')
+    else:
+        logger.warning('Running with in-memory DB; tables may be ephemeral')
+
 
 # 確保新版欄位存在（sqlite ALTER TABLE 加欄位）
 def _ensure_db_migrations():
+    if DB_ABS_PATH == ':memory:':
+        logger.info('In-memory DB used; skipping file-based migrations')
+        return
     try:
         conn = sqlite3.connect(DB_ABS_PATH)
         cur = conn.cursor()
@@ -212,22 +333,10 @@ def _ensure_db_migrations():
                 logger.info('Added realized column to manager_transactions')
             except Exception as e:
                 logger.warning(f'Failed to add realized column: {e}')
-        # Ensure users.first_login_done exists
-        try:
-            cur.execute("PRAGMA table_info('users')")
-            ucols = [r[1] for r in cur.fetchall()]
-            if 'first_login_done' not in ucols:
-                try:
-                    cur.execute("ALTER TABLE users ADD COLUMN first_login_done BOOLEAN DEFAULT 0")
-                    conn.commit()
-                    logger.info('Added first_login_done column to users')
-                except Exception as e:
-                    logger.warning(f'Failed to add first_login_done column: {e}')
-        except Exception:
-            pass
         conn.close()
     except Exception as e:
-        logger.warning(f'DB migration check failed: {e}')
+        logger.warning(f'DB migration check failed: {e}', exc_info=True)
+
 
 _ensure_db_migrations()
 
@@ -237,37 +346,6 @@ _ensure_db_migrations()
 def tz_now():
     """返回台北時區的當前時間"""
     return datetime.datetime.now(ZoneInfo("Asia/Taipei"))
-
-def format_timedelta(td: datetime.timedelta) -> str:
-    try:
-        total = int(td.total_seconds())
-        if total < 0:
-            total = 0
-        h = total // 3600
-        m = (total % 3600) // 60
-        s = total % 60
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    except Exception:
-        return "00:00:00"
-
-def compute_next_open(now: datetime.datetime) -> datetime.datetime:
-    # now is tz-aware (Asia/Taipei)
-    try:
-        cur = now
-        # If before today's open (09:00), return today 09:00
-        today_open = cur.replace(hour=9, minute=0, second=0, microsecond=0)
-        today_close = cur.replace(hour=13, minute=30, second=0, microsecond=0)
-        if cur < today_open and cur.weekday() < 5:
-            return today_open
-        # else find next weekday at 09:00
-        delta = 1
-        while True:
-            nxt = (cur + datetime.timedelta(days=delta)).replace(hour=9, minute=0, second=0, microsecond=0)
-            if nxt.weekday() < 5:
-                return nxt
-            delta += 1
-    except Exception:
-        return now + datetime.timedelta(hours=16)
 
 def is_market_open(dt: datetime.datetime = None) -> bool:
     """檢查台灣股市是否開盤（台北時間）"""
@@ -414,6 +492,42 @@ def get_latest_price(symbol: str, timeout: int = 10):
             logger.warning(f"Failed to get price from history for {symbol}: {e}")
         
         logger.error(f"Could not get price for {symbol}")
+        # Fallback: 嘗試 FinMind -> TWSE 作為備援
+        try:
+            base = symbol.split('.')[0]
+            today = tz_now().date()
+            start = (today - datetime.timedelta(days=7)).isoformat()
+            end = today.isoformat()
+            try:
+                fdf = fetch_finmind_price(base, start_date=start, end_date=end)
+                if isinstance(fdf, pd.DataFrame) and not fdf.empty:
+                    for col in ('Close', 'close', '收盤價', '收盤'):
+                        if col in fdf.columns:
+                            try:
+                                val = float(str(fdf[col].dropna().iloc[-1]).replace(',', ''))
+                                return val
+                            except Exception:
+                                continue
+            except Exception:
+                pass
+
+            try:
+                date_tw = today.strftime('%Y%m%d')
+                tdf = fetch_twse_daily(base, date_tw)
+                if isinstance(tdf, pd.DataFrame) and not tdf.empty:
+                    # 嘗試解析最後一列的數值欄位
+                    row = tdf.iloc[-1]
+                    for c in reversed(list(tdf.columns)):
+                        raw = str(row[c]).replace(',', '').replace('--', '').strip()
+                        try:
+                            return float(raw)
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+        except Exception:
+            pass
         return None
         
     except Exception as e:
@@ -1170,17 +1284,6 @@ def get_company_display(symbol: str) -> str:
             pass
 
     # 快速嘗試從 yfinance 抓一次（輕量）
-    # 先嘗試 FinMind 取得公司資訊（若可用）
-    try:
-        try:
-            fin_name = fetch_finmind_company_info(symbol)
-            if fin_name:
-                return f"{fin_name} {base}"
-        except Exception:
-            pass
-    except Exception:
-        pass
-
     try:
         info, *_ = safe_ticker_fetch(symbol, retries=1, backoff=0.5)
         if info and isinstance(info, dict):
@@ -1297,146 +1400,6 @@ def round_half_up(n, ndigits=2):
     except Exception:
         return float(Decimal(n).quantize(exp, rounding=ROUND_HALF_UP))
 
-# ------------------- FinMind + 觀看次數 支援函式 -------------------
-def fetch_finmind_api(dataset: str, stock_id: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """通用 FinMind API 呼叫（若成功回傳 DataFrame，否則回傳空 DataFrame）。"""
-    try:
-        import requests
-        url = f"https://api.finmindtrade.com/api/v3/data?dataset={dataset}&stock_id={stock_id}&start_date={start_date}&end_date={end_date}"
-        token = os.environ.get('FINMIND_API_KEY') or os.environ.get('FINMIND_TOKEN')
-        if token:
-            url = url + f"&token={token}"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        js = r.json()
-        data = js.get('data') if isinstance(js, dict) else None
-        if data:
-            return pd.DataFrame(data)
-    except Exception:
-        pass
-    return pd.DataFrame()
-
-def fetch_finmind_institutional(symbol: str, days: int = 10) -> pd.DataFrame:
-    base = symbol.split('.')[0].upper()
-    end = tz_now().strftime('%Y-%m-%d')
-    start = (tz_now() - datetime.timedelta(days=max(7, days * 2))).strftime('%Y-%m-%d')
-    datasets = ['TaiwanStockInstitutionalInvestorsBuySell', 'TaiwanStockInstitutionalInvestors']
-    for ds in datasets:
-        df = fetch_finmind_api(ds, base, start, end)
-        if not df.empty:
-            return df
-    return pd.DataFrame()
-
-def fetch_finmind_financials(symbol: str):
-    base = symbol.split('.')[0].upper()
-    end = tz_now().strftime('%Y-%m-%d')
-    start = (tz_now() - datetime.timedelta(days=365 * 3)).strftime('%Y-%m-%d')
-    datasets = [
-        'TaiwanStockFinancialStatements',
-        'TaiwanStockFinancialStatementsQuarterly',
-        'TaiwanStockFinancialReport',
-        'FinancialStatements',
-        'FinancialStatementsQuarterly'
-    ]
-    results = {'financials': pd.DataFrame(), 'balance': pd.DataFrame(), 'cashflow': pd.DataFrame(), 'errors': []}
-    for ds in datasets:
-        df = fetch_finmind_api(ds, base, start, end)
-        if df is not None and not df.empty:
-            results['financials'] = df
-            return results
-    return results
-
-def fetch_finmind_company_info(symbol: str):
-    base = symbol.split('.')[0].upper()
-    end = tz_now().strftime('%Y-%m-%d')
-    start = (tz_now() - datetime.timedelta(days=365)).strftime('%Y-%m-%d')
-    datasets = ['TaiwanStockInfo', 'TaiwanStockCompany', 'TaiwanStockListing']
-    for ds in datasets:
-        df = fetch_finmind_api(ds, base, start, end)
-        if not df.empty:
-            for col in ('company_name', 'short_name', 'full_name', 'name', 'Company', 'company'):
-                if col in df.columns:
-                    return df.iloc[0].get(col)
-            for c in df.columns:
-                if df[c].dtype == object:
-                    val = df.iloc[0].get(c)
-                    if isinstance(val, str) and len(val) < 120:
-                        return val
-    return None
-
-# ---------------- TradingView embed helper ----------------
-def tradingview_symbol(symbol: str) -> str:
-    base = symbol.split('.')[0]
-    s = symbol.upper()
-    if s.endswith('.TW') or s.endswith('.TWF') or s.endswith('.TPE'):
-        return f"TPE:{base}"
-    if s.endswith('.TWO'):
-        return f"TWO:{base}"
-    if base.isdigit():
-        return f"TPE:{base}"
-    return symbol
-
-def tradingview_widget_html(tv_symbol: str, interval: str = 'D', height: int = 600) -> str:
-    cid = 'tv_' + uuid.uuid4().hex[:8]
-    html = f'''<div class="tradingview-widget-container"><div id="{cid}"></div>
-    <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-    <script type="text/javascript">
-    new TradingView.widget({{
-        "width": "100%",
-        "height": {height},
-        "symbol": "{tv_symbol}",
-        "interval": "{interval}",
-        "timezone": "Asia/Taipei",
-        "theme": "dark",
-        "style": "1",
-        "locale": "zh_TW",
-        "toolbar_bg": "#1f2937",
-        "enable_publishing": false,
-        "hide_legend": true,
-        "container_id": "{cid}"
-    }});
-    </script></div>'''
-    return html
-
-# 瀏覽次數計數器
-VIEW_COUNT_FILE = os.path.join(BASE_STORAGE, "view_counts.json")
-
-def _load_view_counts():
-    try:
-        if os.path.exists(VIEW_COUNT_FILE):
-            with open(VIEW_COUNT_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
-
-def increment_view_count():
-    try:
-        counts = _load_view_counts()
-        today = tz_now().date().isoformat()
-        counts[today] = int(counts.get(today, 0)) + 1
-        with open(VIEW_COUNT_FILE, 'w', encoding='utf-8') as f:
-            json.dump(counts, f)
-        return counts[today]
-    except Exception:
-        return 0
-
-def get_today_views():
-    counts = _load_view_counts()
-    return int(counts.get(tz_now().date().isoformat(), 0))
-
-def render_view_counter():
-    try:
-        count = get_today_views()
-        html = f"""
-        <div style='position:fixed;left:12px;bottom:12px;z-index:9999;background:rgba(0,0,0,0.6);color:#fff;padding:6px 10px;border-radius:8px;font-size:13px'>今日瀏覽: {count} 次</div>
-        """
-        st.markdown(html, unsafe_allow_html=True)
-    except Exception:
-        pass
-
-# ------------------------------------------------------------------
-
 def try_fetch_three_major_flow(symbol: str, days: int = 10):
     """嘗試從 Yahoo（台股頁面或 finance.yahoo.com）抓三大法人買賣超表格。
     回傳 (DataFrame, message)。若無法取得則回傳空 DataFrame 與原因說明。
@@ -1453,13 +1416,6 @@ def try_fetch_three_major_flow(symbol: str, days: int = 10):
         candidates = [base + '.TW', base + '.TWO', base]
     else:
         candidates = [s]
-    # 優先嘗試 FinMind API（若可用）以取得三大法人買賣超
-    try:
-        fin_df = fetch_finmind_institutional(base, days=days)
-        if fin_df is not None and not fin_df.empty:
-            return fin_df, '從 FinMind API 取得法人資料'
-    except Exception:
-        pass
 
     urls = []
     for cand in candidates:
@@ -1490,14 +1446,6 @@ def fetch_financials_via_web(symbol: str):
     """嘗試從 Yahoo Finance 網頁抓取財務報表表格（損益表、資產負債表、現金流量表）。
     注意：Yahoo 使用動態載入，讀取可能失敗；此函式會嘗試用 pandas.read_html 解析。"""
     results = {'financials': pd.DataFrame(), 'balance': pd.DataFrame(), 'cashflow': pd.DataFrame(), 'errors': []}
-    # 優先嘗試使用 FinMind API 取得財報資料
-    try:
-        fm_res = fetch_finmind_financials(symbol)
-        if fm_res and isinstance(fm_res, dict) and not fm_res.get('financials', pd.DataFrame()).empty:
-            results.update(fm_res)
-            return results
-    except Exception:
-        pass
     try:
         import requests
     except Exception:
@@ -1687,6 +1635,108 @@ def fetch_financials_via_web(symbol: str):
 
     return results
 
+def finmind_get(dataset: str, params: dict):
+    """簡單的 FinMind API wrapper。需要在環境變數 `FINMIND_API_TOKEN` 或
+    `harry_data/finmind_token.json` 裡放 token。失敗時回傳 None。
+    """
+    try:
+        import requests
+    except Exception:
+        logger.warning('requests 未安裝，無法呼叫 FinMind')
+        return None
+
+    token = os.environ.get('FINMIND_API_TOKEN')
+    token_file = os.path.join(BASE_STORAGE, 'finmind_token.json')
+    if not token and os.path.exists(token_file):
+        try:
+            with open(token_file, 'r') as f:
+                j = json.load(f)
+                token = j.get('token') or j.get('api_token') or j.get('apiKey')
+        except Exception:
+            token = None
+
+    if not token:
+        logger.warning('FinMind token not configured; skipping FinMind API')
+        return None
+
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    params = params.copy()
+    params.update({'dataset': dataset, 'token': token})
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning(f'FinMind request failed: {e}')
+        return None
+
+
+def fetch_finmind_price(stock_id: str, start_date: str = None, end_date: str = None):
+    """使用 FinMind 取得台股日線價格（若可用），回傳 DataFrame 或空的 DataFrame。"""
+    params = {'data_id': stock_id}
+    if start_date:
+        params['start_date'] = start_date
+    if end_date:
+        params['end_date'] = end_date
+    res = finmind_get('TaiwanStockPrice', params)
+    if not res:
+        return pd.DataFrame()
+    data = res.get('data') or res.get('result') or []
+    try:
+        return pd.DataFrame(data)
+    except Exception:
+        return pd.DataFrame()
+
+
+def fetch_twse_daily(stock_no: str, date: str):
+    """使用 TWSE 公開 API 取得日線資料（YYYYMMDD）。回傳 DataFrame 或空 DataFrame。"""
+    try:
+        import requests
+    except Exception:
+        logger.warning('requests 未安裝，無法呼叫 TWSE')
+        return pd.DataFrame()
+
+    url = 'https://www.twse.com.tw/exchangeReport/STOCK_DAY'
+    params = {'response': 'json', 'date': date, 'stockNo': stock_no}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        data = j.get('data', [])
+        fields = j.get('fields', []) or j.get('title', [])
+        if data:
+            df = pd.DataFrame(data)
+            if fields and len(fields) == df.shape[1]:
+                df.columns = fields
+            return df
+    except Exception as e:
+        logger.warning(f'TWSE daily fetch failed for {stock_no}@{date}: {e}')
+    return pd.DataFrame()
+
+
+def fetch_twse_three_major(date: str):
+    """取得三大法人日買賣超（TWSE），回傳 JSON 或空 dict。"""
+    try:
+        import requests
+    except Exception:
+        logger.warning('requests 未安裝，無法呼叫 TWSE')
+        return {}
+
+    # 嘗試常見的三大法人 API 路徑
+    urls = [
+        'https://www.twse.com.tw/fund/T86',
+        'https://www.twse.com.tw/fund/T86?response=json'
+    ]
+    params = {'response': 'json', 'date': date}
+    for u in urls:
+        try:
+            r = requests.get(u, params=params, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            continue
+    return {}
+
 def compute_portfolio_metrics():
     db = get_db()
     try:
@@ -1867,8 +1917,67 @@ def render_financial_wall(symbol):
                 except Exception:
                     continue
 
-            # 若 yfinance 沒抓到完整財報，再嘗試網頁抓取（Yahoo）
+            # 若 yfinance 沒抓到完整財報，先嘗試 FinMind / TWSE 作為價格備援，再退回到網頁抓取（Yahoo）
             if (not info or (financials.empty and balance.empty and cashflow.empty)):
+                today = tz_now().date()
+                start = (today - datetime.timedelta(days=7)).isoformat()
+                end = today.isoformat()
+
+                for cand in candidates:
+                    base_id = cand.split('.')[0]
+                    # FinMind 僅作為價格備援
+                    try:
+                        fdf = fetch_finmind_price(base_id, start_date=start, end_date=end)
+                        if isinstance(fdf, pd.DataFrame) and not fdf.empty:
+                            # 支援多種欄名（Close / close / 收盤）
+                            for col in ('Close', 'close', '收盤價', '收盤'):
+                                if col in fdf.columns:
+                                    try:
+                                        last_price = float(str(fdf[col].dropna().iloc[-1]).replace(',', ''))
+                                        info = info or {}
+                                        info['currentPrice'] = last_price
+                                        break
+                                    except Exception:
+                                        continue
+                    except Exception:
+                        pass
+
+                    # 再嘗試 TWSE 的日線（以取得當日收盤）
+                    try:
+                        date_tw = today.strftime('%Y%m%d')
+                        tdf = fetch_twse_daily(base_id, date_tw)
+                        if isinstance(tdf, pd.DataFrame) and not tdf.empty:
+                            # 嘗試解析最後一欄或已知中文欄位
+                            try:
+                                row = tdf.iloc[-1]
+                                val = None
+                                # 優先尋找可能的收盤欄位
+                                for col in ('收盤價', '收盤', 'Close', 'close'):
+                                    if col in tdf.columns:
+                                        raw = str(row[col])
+                                        val = raw.replace(',', '').replace('--', '').strip()
+                                        try:
+                                            info = info or {}
+                                            info['currentPrice'] = float(val)
+                                            break
+                                        except Exception:
+                                            val = None
+                                # 若上述都找不到，再嘗試找數值欄位
+                                if 'currentPrice' not in (info or {}) and val is None:
+                                    for c in reversed(list(tdf.columns)):
+                                        raw = str(row[c]).replace(',', '').replace('--', '').strip()
+                                        try:
+                                            info = info or {}
+                                            info['currentPrice'] = float(raw)
+                                            break
+                                        except Exception:
+                                            continue
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                # 最後退回到原有的網頁抓取（如果仍然缺財報）
                 for cand in candidates:
                     try:
                         res = fetch_financials_via_web(cand)
@@ -1889,26 +1998,7 @@ def render_financial_wall(symbol):
                     except Exception:
                         continue
 
-            # 若仍無法人或財報，嘗試使用 FinMind 補充資料
-            try:
-                try:
-                    if (inst is None) or (hasattr(inst, 'empty') and inst.empty) or (hasattr(major, 'empty') and major.empty):
-                        fin_inst = fetch_finmind_institutional(symbol, days=10)
-                        if fin_inst is not None and not fin_inst.empty:
-                            inst = fin_inst
-                except Exception:
-                    pass
-                try:
-                    if (financials is None) or (hasattr(financials, 'empty') and financials.empty):
-                        fin_fin = fetch_finmind_financials(symbol)
-                        if fin_fin and isinstance(fin_fin, dict) and not fin_fin.get('financials', pd.DataFrame()).empty:
-                            financials = fin_fin['financials']
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.debug(f"FinMind supplement failed: {e}")
-
-            # 寫入快取
+        # 寫入快取
         try:
             if info or not financials.empty or not balance.empty or not cashflow.empty:
                 if not cache:
@@ -2243,23 +2333,6 @@ def render_financial_wall(symbol):
 # [STAGE 4] 主介面
 # ==============================================================================
 def main():
-    # 清理過期的管理員驗證碼
-    db = get_db()
-    try:
-        expired = db.query(AdminVerification).filter(AdminVerification.expires_at < datetime.datetime.now()).all()
-        for e in expired:
-            db.delete(e)
-        db.commit()
-    except Exception:
-        db.rollback()
-    finally:
-        db.close()
-    # 記錄今日瀏覽次數
-    try:
-        increment_view_count()
-    except Exception:
-        pass
-    
     st.set_page_config(page_title="HARRY 股票系統", layout="wide")
     
     st.markdown("""<style>
@@ -2281,12 +2354,6 @@ def main():
         .login-light { width:16px; height:16px; border-radius:50%; background:#fff; box-shadow:0 0 10px rgba(255,255,255,0.6); animation: harry-blinker 0.8s linear infinite; }
 
     </style>""", unsafe_allow_html=True)
-
-    # 顯示頁面左下瀏覽次數
-    try:
-        render_view_counter()
-    except Exception:
-        pass
 
     # 登入成功歡迎動畫（若剛登入）
     if st.session_state.get('just_logged_in'):
@@ -2330,122 +2397,19 @@ def main():
             st.subheader("🔐 系統認證")
             u = st.text_input("帳號")
             p = st.text_input("密鑰", type="password")
-            # 暫不允許未登入使用者配置 SMTP（移回管理員後台）
-            
-            # 如果正在等待管理員驗證碼
-            if st.session_state.get('awaiting_admin_code'):
-                st.subheader("管理員驗證")
-                entered_code = st.text_input("請輸入管理員驗證碼", type="password")
-                if st.button("驗證"):
-                    db = get_db()
-                    try:
-                        # 檢查驗證碼
-                        verif = db.query(AdminVerification).filter_by(
-                            username=st.session_state.get('admin_username'),
-                            code=entered_code,
-                            used=False
-                        ).first()
-                        if verif and datetime.datetime.now() < verif.expires_at:
-                            verif.used = True
-                            db.commit()
-                            st.session_state.logged = True
-                            st.session_state.user = st.session_state['admin_username']
-                            st.session_state.role = 'admin'
-                            st.session_state['just_logged_in'] = True
-                            st.session_state['just_logged_in_at'] = time.time()
-                            st.success("驗證成功，登入中...")
-                            # 清理
-                            del st.session_state['awaiting_admin_code']
-                            del st.session_state['admin_username']
-                            safe_rerun()
-                        else:
-                            st.error("驗證碼錯誤或已過期")
-                    except Exception as e:
-                        db.rollback()
-                        st.error(f"驗證失敗: {e}")
-                    finally:
-                        db.close()
-                if st.button("取消"):
-                    del st.session_state['awaiting_admin_code']
-                    del st.session_state['admin_username']
-                    st.info("已取消")
-                    safe_rerun()
-                return
-            
-            if st.button("確認登入"):
+            if st.button("解鎖終端"):
                 db = get_db()
                 user = db.query(User).filter_by(username=u).first()
                 db.close()
                 
                 if user and user.is_active and verify_password(user.password, p, u):
-                    if user.role == 'admin':
-                        # admin: 若尚未完成首次免驗證登入，則視為第一次登入，直接標記並登入；之後再需要 OTP
-                        db2 = get_db()
-                        try:
-                            urec = db2.query(User).filter_by(username=u).first()
-                            if not getattr(urec, 'first_login_done', False):
-                                # 首次登入免驗證，標記完成
-                                urec.first_login_done = True
-                                try:
-                                    db2.add(AuditLog(actor=u, action='first_login_no_otp', target=u))
-                                except Exception:
-                                    pass
-                                db2.commit()
-                                db2.close()
-                                st.session_state.logged = True
-                                st.session_state.user = u
-                                st.session_state.role = user.role
-                                st.session_state['just_logged_in'] = True
-                                st.session_state['just_logged_in_at'] = time.time()
-                                st.success("首次登入免驗證，已登入")
-                                st.rerun()
-                            else:
-                                # 非首次登入，啟動 OTP 驗證流程（寄送 20 位亂碼）
-                                import secrets
-                                code = secrets.token_hex(10)  # 20 字元
-                                expires_at = datetime.datetime.now() + datetime.timedelta(minutes=3)
-                                try:
-                                    db2.add(AdminVerification(username=u, code=code, expires_at=expires_at))
-                                    db2.commit()
-                                except Exception as e:
-                                    db2.rollback()
-                                    db2.close()
-                                    st.error(f"生成驗證碼失敗: {e}")
-                                    return
-                                db2.close()
-                                smtp_cfg = load_smtp_config()
-                                if smtp_cfg:
-                                    try:
-                                        send_email('yyy666001@gmail.com', '管理員登入驗證碼', f'您的驗證碼是: {code}\n有效期 3 分鐘。', smtp_cfg)
-                                        st.success("驗證碼已發送（請檢查管理員信箱）")
-                                    except Exception as e:
-                                        st.error(f"發送郵件失敗: {e}")
-                                        return
-                                else:
-                                    st.error("SMTP 未配置，無法發送驗證碼")
-                                    return
-                                st.session_state['awaiting_admin_code'] = True
-                                st.session_state['admin_username'] = u
-                                st.info("請檢查郵件並輸入驗證碼")
-                                safe_rerun()
-                        except Exception as e:
-                            try:
-                                db2.rollback()
-                            except Exception:
-                                pass
-                            try:
-                                db2.close()
-                            except Exception:
-                                pass
-                            st.error(f"登入處理失敗: {e}")
-                            return
-                    else:
-                        st.session_state.logged = True
-                        st.session_state.user = u
-                        st.session_state.role = user.role
-                        st.session_state['just_logged_in'] = True
-                        st.session_state['just_logged_in_at'] = time.time()
-                        st.rerun()
+                    st.session_state.logged = True
+                    st.session_state.user = u
+                    st.session_state.role = user.role
+                    # 標記為剛登入以顯示歡迎動畫，稍後在 main() 處理
+                    st.session_state['just_logged_in'] = True
+                    st.session_state['just_logged_in_at'] = time.time()
+                    st.rerun()
                 else:
                     st.error("帳號或密碼錯誤")
             return
@@ -2482,7 +2446,7 @@ def main():
                 "管理員績效",
                 "管理員後台",
                 "問題回報"
-            ], key='main_menu')
+            ])
             
             if st.button("安全登出"):
                 st.session_state.logged = False
@@ -2493,45 +2457,17 @@ def main():
         st.title("🏠 系統控制中心")
         now = tz_now()
         st.markdown(f"**台北時間**: {now.strftime('%Y-%m-%d %H:%M:%S')}")
-        # 市場開盤 / 收盤倒數顯示
-        today_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        today_close = now.replace(hour=13, minute=30, second=0, microsecond=0)
-        if now.weekday() < 5 and today_open <= now <= today_close:
-            remaining = today_close - now
+        if is_market_open(now):
             render_status_light("市場開盤中", color="#10b981", blink=True)
-            st.info(f"距離收盤還有 {format_timedelta(remaining)}")
         else:
-            next_open = compute_next_open(now)
-            until_open = next_open - now
+            # 休市也要閃爍以維持一致的視覺動態
             render_status_light("市場休市", color="#6b7280", blink=True)
-            st.info(f"距離下次開盤還有 {format_timedelta(until_open)}")
-
-        # 市場快照（TWSE 加權、近期台指期、黃金、TSM ADR）
-        st.markdown("---")
-        st.subheader("市場快照")
-        snap_cols = st.columns(4)
-        try:
-            snapshots = {
-                '加權指數': '^TWII',
-                '台指期 (近月)': 'TXF=F',
-                '黃金 (USD/oz)': 'GC=F',
-                'TSM ADR': 'TSM'
-            }
-            for (label, sym), c in zip(snapshots.items(), snap_cols):
-                val = get_latest_price(sym)
-                if val is None:
-                    c.write(f"{label}: N/A")
-                else:
-                    c.write(f"{label}: {val:,.2f}")
-        except Exception:
-            for c in snap_cols:
-                c.write("資料暫時不可用")
 
         st.subheader("📢 系統公告")
         db = get_db()
         all_n = db.query(SystemNotice).order_by(SystemNotice.created_at.desc()).all()
         db.close()
-
+        
         if all_n:
             for n in all_n:
                 with st.expander(f"📌 {n.title} - {n.created_at.strftime('%Y-%m-%d')}"):
@@ -2578,8 +2514,6 @@ def main():
             macd_signal = st.number_input("MACD signal 週期", min_value=3, max_value=50, value=9)
             show_rsi = st.checkbox("顯示 RSI", value=False)
             rsi_period = st.number_input("RSI 週期", min_value=5, max_value=50, value=14)
-            use_tradingview = st.checkbox("使用 TradingView 即時圖表", value=False)
-            tv_interval = st.selectbox("TradingView 週期", ["1", "5", "15", "60", "D"], index=4)
 
         try:
             with st.spinner(f"正在繪製 {target} 的圖表..."):
@@ -2590,102 +2524,94 @@ def main():
                         target = resolved_target
                 except Exception:
                     pass
-                if use_tradingview:
-                    try:
-                        tv_sym = tradingview_symbol(target)
-                        tv_html = tradingview_widget_html(tv_sym, interval=tv_interval, height=640)
-                        components.html(tv_html, height=660)
-                    except Exception as e:
-                        st.error(f"TradingView embed failed: {e}")
+                hist = yf.Ticker(target).history(period=period)
+                if hist is None or hist.empty:
+                    st.warning("無法取得歷史資料")
                 else:
-                    hist = yf.Ticker(target).history(period=period)
-                    if hist is None or hist.empty:
-                        st.warning("無法取得歷史資料")
+                    # 移除 OHLC 任一為空或為 0 的列，並排除週末（保險）
+                    hist_clean = hist.dropna(subset=['Open', 'High', 'Low', 'Close'])
+                    try:
+                        hist_clean = hist_clean[(hist_clean['Open'] != 0) & (hist_clean['High'] != 0) & (hist_clean['Low'] != 0) & (hist_clean['Close'] != 0)]
+                    except Exception:
+                        pass
+                    try:
+                        # 移除 index 為週末的資料（若存在）
+                        hist_clean = hist_clean[~hist_clean.index.to_series().dt.weekday.isin([5,6])]
+                    except Exception:
+                        pass
+                    if hist_clean.empty:
+                        st.warning("歷史資料無有效 OHLC 資料，無法繪製 K 棒")
                     else:
-                        # 移除 OHLC 任一為空或為 0 的列，並排除週末（保險）
-                        hist_clean = hist.dropna(subset=['Open', 'High', 'Low', 'Close'])
-                        try:
-                            hist_clean = hist_clean[(hist_clean['Open'] != 0) & (hist_clean['High'] != 0) & (hist_clean['Low'] != 0) & (hist_clean['Close'] != 0)]
-                        except Exception:
-                            pass
-                        try:
-                            # 移除 index 為週末的資料（若存在）
-                            hist_clean = hist_clean[~hist_clean.index.to_series().dt.weekday.isin([5,6])]
-                        except Exception:
-                            pass
-                        if hist_clean.empty:
-                            st.warning("歷史資料無有效 OHLC 資料，無法繪製 K 棒")
+                        # 合併/清理 OHLC，得到日 K
+                        df = _clean_and_aggregate_ohlc(hist_clean)
+                        if df is None or df.empty:
+                            st.warning("無有效 K 棒資料可繪製")
                         else:
-                            # 合併/清理 OHLC，得到日 K
-                            df = _clean_and_aggregate_ohlc(hist_clean)
-                            if df is None or df.empty:
-                                st.warning("無有效 K 棒資料可繪製")
-                            else:
-                                # 額外均線
-                                ma_windows = []
-                                try:
-                                    ma_windows = [int(x.strip()) for x in ma_input.split(',') if x.strip()]
-                                except Exception:
-                                    ma_windows = [5,10,20]
-                                for n in ma_windows:
-                                    if n > 0:
-                                        df[f"MA{n}"] = df['Close'].rolling(window=n).mean()
+                            # 額外均線
+                            ma_windows = []
+                            try:
+                                ma_windows = [int(x.strip()) for x in ma_input.split(',') if x.strip()]
+                            except Exception:
+                                ma_windows = [5,10,20]
+                            for n in ma_windows:
+                                if n > 0:
+                                    df[f"MA{n}"] = df['Close'].rolling(window=n).mean()
 
-                                # 布林帶
-                                if show_bb and bb_window > 0:
-                                    df['BB_MA'] = df['Close'].rolling(window=bb_window).mean()
-                                    df['BB_STD'] = df['Close'].rolling(window=bb_window).std()
-                                    df['BB_UP'] = df['BB_MA'] + (df['BB_STD'] * bb_std)
-                                    df['BB_LOW'] = df['BB_MA'] - (df['BB_STD'] * bb_std)
+                            # 布林帶
+                            if show_bb and bb_window > 0:
+                                df['BB_MA'] = df['Close'].rolling(window=bb_window).mean()
+                                df['BB_STD'] = df['Close'].rolling(window=bb_window).std()
+                                df['BB_UP'] = df['BB_MA'] + (df['BB_STD'] * bb_std)
+                                df['BB_LOW'] = df['BB_MA'] - (df['BB_STD'] * bb_std)
 
-                                # MACD
-                                if show_macd:
-                                    df['MACD_LINE'], df['MACD_SIGNAL'], df['MACD_HIST'] = compute_macd(df['Close'], short=macd_short, long=macd_long, signal=macd_signal)
+                            # MACD
+                            if show_macd:
+                                df['MACD_LINE'], df['MACD_SIGNAL'], df['MACD_HIST'] = compute_macd(df['Close'], short=macd_short, long=macd_long, signal=macd_signal)
 
-                                # RSI
-                                if show_rsi:
-                                    df['RSI'] = compute_rsi(df['Close'], period=int(rsi_period))
+                            # RSI
+                            if show_rsi:
+                                df['RSI'] = compute_rsi(df['Close'], period=int(rsi_period))
 
-                                # 決定子圖數量
-                                indicator_rows = []
-                                if show_macd:
-                                    indicator_rows.append('macd')
-                                if show_rsi:
-                                    indicator_rows.append('rsi')
+                            # 決定子圖數量
+                            indicator_rows = []
+                            if show_macd:
+                                indicator_rows.append('macd')
+                            if show_rsi:
+                                indicator_rows.append('rsi')
 
-                                rows = 1 + len(indicator_rows)
-                                fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6] + [0.2]*len(indicator_rows))
+                            rows = 1 + len(indicator_rows)
+                            fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6] + [0.2]*len(indicator_rows))
 
-                                # K 棒（以分類 x 軸顯示，避免因節假日造成可視化空格）
-                                x_cat = df.index.strftime('%Y-%m-%d')
-                                fig.add_trace(go.Candlestick(x=x_cat, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K棒"), row=1, col=1)
-                                # 加入均線
-                                for n in ma_windows:
-                                    if f"MA{n}" in df.columns:
-                                        fig.add_trace(go.Scatter(x=x_cat, y=df[f"MA{n}"], mode='lines', name=f"MA{n}"), row=1, col=1)
+                            # K 棒（以分類 x 軸顯示，避免因節假日造成可視化空格）
+                            x_cat = df.index.strftime('%Y-%m-%d')
+                            fig.add_trace(go.Candlestick(x=x_cat, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K棒"), row=1, col=1)
+                            # 加入均線
+                            for n in ma_windows:
+                                if f"MA{n}" in df.columns:
+                                    fig.add_trace(go.Scatter(x=x_cat, y=df[f"MA{n}"], mode='lines', name=f"MA{n}"), row=1, col=1)
 
-                                # 布林帶
-                                if show_bb and 'BB_UP' in df.columns:
-                                    fig.add_trace(go.Scatter(x=x_cat, y=df['BB_UP'], line={'color':'rgba(255,255,255,0.15)'}, name='BB上軌', showlegend=True), row=1, col=1)
-                                    fig.add_trace(go.Scatter(x=x_cat, y=df['BB_LOW'], line={'color':'rgba(255,255,255,0.15)'}, name='BB下軌', showlegend=True), row=1, col=1)
+                            # 布林帶
+                            if show_bb and 'BB_UP' in df.columns:
+                                fig.add_trace(go.Scatter(x=x_cat, y=df['BB_UP'], line={'color':'rgba(255,255,255,0.15)'}, name='BB上軌', showlegend=True), row=1, col=1)
+                                fig.add_trace(go.Scatter(x=x_cat, y=df['BB_LOW'], line={'color':'rgba(255,255,255,0.15)'}, name='BB下軌', showlegend=True), row=1, col=1)
 
-                                # 指標區塊
-                                row_idx = 2
-                                if show_macd:
-                                    fig.add_trace(go.Bar(x=x_cat, y=df['MACD_HIST'], name='MACD_HIST'), row=row_idx, col=1)
-                                    fig.add_trace(go.Scatter(x=x_cat, y=df['MACD_LINE'], name='MACD_LINE', line={'width':1}), row=row_idx, col=1)
-                                    fig.add_trace(go.Scatter(x=x_cat, y=df['MACD_SIGNAL'], name='MACD_SIGNAL', line={'width':1, 'dash':'dot'}), row=row_idx, col=1)
-                                    row_idx += 1
-                                if show_rsi:
-                                    fig.add_trace(go.Scatter(x=x_cat, y=df['RSI'], name='RSI'), row=row_idx, col=1)
+                            # 指標區塊
+                            row_idx = 2
+                            if show_macd:
+                                fig.add_trace(go.Bar(x=x_cat, y=df['MACD_HIST'], name='MACD_HIST'), row=row_idx, col=1)
+                                fig.add_trace(go.Scatter(x=x_cat, y=df['MACD_LINE'], name='MACD_LINE', line={'width':1}), row=row_idx, col=1)
+                                fig.add_trace(go.Scatter(x=x_cat, y=df['MACD_SIGNAL'], name='MACD_SIGNAL', line={'width':1, 'dash':'dot'}), row=row_idx, col=1)
+                                row_idx += 1
+                            if show_rsi:
+                                fig.add_trace(go.Scatter(x=x_cat, y=df['RSI'], name='RSI'), row=row_idx, col=1)
 
-                                fig.update_layout(height=900, template='plotly_dark', xaxis_rangeslider_visible=False)
-                                # 使用分類 x 軸，將有資料的日期緊密排列，避免空格
-                                try:
-                                    fig.update_xaxes(type='category')
-                                except Exception:
-                                    pass
-                                st.plotly_chart(fig, use_container_width=True)
+                            fig.update_layout(height=900, template='plotly_dark', xaxis_rangeslider_visible=False)
+                            # 使用分類 x 軸，將有資料的日期緊密排列，避免空格
+                            try:
+                                fig.update_xaxes(type='category')
+                            except Exception:
+                                pass
+                            st.plotly_chart(fig, use_container_width=True)
         except Exception as e:
             logger.error(f"Chart rendering error: {e}")
             st.error(f"圖表繪製失敗: {e}")
@@ -2781,8 +2707,6 @@ def main():
                         st.session_state._search_target = resolved or w.symbol
                     except Exception:
                         st.session_state._search_target = w.symbol
-                    # 導向股票資料中心頁面
-                    st.session_state['main_menu'] = "股票資料中心"
                     st.rerun()
                 if cols[4].button("刪除", key=f"wd_{w.id}"):
                     remove_watchlist(user, w.symbol)
@@ -2901,21 +2825,15 @@ def main():
                 t_symbol = st.text_input("代碼 (可輸入 2330 或 2330.TW)", "2330").strip().upper()
                 t_action = st.selectbox("動作", ["buy", "sell"])
                 t_shares = st.number_input("股數", 1.0)
-                t_price = st.number_input("價格 (0 = 市價)", value=float(st.session_state.get('trade_price_input', 0.0)))
+                t_price = st.number_input("價格 (0 = 市價)", 0.0)
 
                 # 兩個表單按鈕：查詢價格 / 準備送出（會先顯示交易明細，需再按確認）
                 if st.form_submit_button("查詢價格"):
                     try:
                         resolved, price = resolve_candidate_symbol(t_symbol)
                         st.session_state['trade_preview'] = {'input': t_symbol, 'resolved': resolved, 'price': price}
-                        # 將查到的價格放入表單輸入，方便使用者看到
-                        if price is not None:
-                            st.session_state['trade_price_input'] = float(price)
-                        else:
-                            st.session_state['trade_price_input'] = float(0.0)
                     except Exception as e:
                         st.session_state['trade_preview'] = {'input': t_symbol, 'resolved': None, 'price': None, 'error': str(e)}
-                        st.session_state['trade_price_input'] = float(0.0)
                     safe_rerun()
 
                 if st.form_submit_button("準備送出"):
