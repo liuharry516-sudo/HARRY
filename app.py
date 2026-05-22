@@ -23,6 +23,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 import logging
 import html as html_module
+import streamlit.components.v1 as components
 
 # ==============================================================================
 # [BUGFIX] 設定日誌系統以便追蹤問題
@@ -1296,6 +1297,582 @@ def get_company_display(symbol: str) -> str:
 
     # 無公司名稱時只回傳代碼
     return f"{base}"
+
+
+def render_market_dashboard_ui():
+        """Render the provided FinanceHub HTML UI inside Streamlit, injecting dynamic data.
+        The function attempts to enrich a set of defaults with live quotes (yfinance)."""
+        st.title("市場總覽 — FinanceHub")
+
+        # Default datasets (based on the provided HTML sample)
+        indices_defaults = [
+                {"name":"台灣加權", "code":"TWII", "price":"22,346.80", "chg":"+184.30", "pct":"+0.83%", "dir":"up"},
+                {"name":"上海綜指", "code":"SSEC", "price":"3,421.55", "chg":"-12.40", "pct":"-0.36%", "dir":"dn"},
+                {"name":"道瓊工業", "code":"DJI",  "price":"42,984.12", "chg":"+302.60", "pct":"+0.71%", "dir":"up"},
+                {"name":"那斯達克", "code":"IXIC", "price":"19,847.36", "chg":"+215.44", "pct":"+1.10%", "dir":"up"},
+        ]
+
+        stocks_defaults = [
+                {"code":"2330", "name":"台積電", "price":"1,085", "chg":"+25", "pct":"+2.36%", "vol":"68,420", "pe":"24.8", "dir":"up", "color":"#4f46e5"},
+                {"code":"2317", "name":"鴻海",   "price":"214.5", "chg":"-3.5", "pct":"-1.61%", "vol":"52,318", "pe":"12.4", "dir":"dn", "color":"#0ea5e9"},
+                {"code":"2454", "name":"聯發科", "price":"1,350", "chg":"+30", "pct":"+2.27%", "vol":"18,765", "pe":"18.9", "dir":"up", "color":"#10b981"},
+                {"code":"2881", "name":"富邦金", "price":"96.8",  "chg":"+0.8", "pct":"+0.83%", "vol":"34,210", "pe":"9.6",  "dir":"up", "color":"#f59e0b"},
+                {"code":"6505", "name":"台塑化", "price":"73.2",  "chg":"-0.9", "pct":"-1.21%", "vol":"12,450", "pe":"14.1", "dir":"dn", "color":"#ef4444"},
+                {"code":"3008", "name":"大立光", "price":"2,480", "chg":"+55", "pct":"+2.27%", "vol":"4,120",  "pe":"35.2", "dir":"up", "color":"#8b5cf6"},
+                {"code":"2886", "name":"兆豐金", "price":"45.6",  "chg":"-0.3", "pct":"-0.65%", "vol":"28,940", "pe":"10.8", "dir":"dn", "color":"#06b6d4"},
+                {"code":"0050", "name":"元大台灣50", "price":"228.5", "chg":"+2.5", "pct":"+1.11%", "vol":"41,700", "pe":"-", "dir":"up", "color":"#84cc16"},
+        ]
+
+        sectors_defaults = [
+                {"name":"半導體", "pct":"+2.14%", "v":2.14},
+                {"name":"電子零件", "pct":"+1.03%", "v":1.03},
+                {"name":"金融",   "pct":"+0.45%", "v":0.45},
+                {"name":"航運",   "pct":"-0.87%", "v":-0.87},
+                {"name":"鋼鐵",   "pct":"-1.24%", "v":-1.24},
+                {"name":"傳產",   "pct":"+0.18%", "v":0.18},
+                {"name":"生技醫療", "pct":"+0.92%", "v":0.92},
+                {"name":"電信",   "pct":"-0.33%", "v":-0.33},
+                {"name":"建材",   "pct":"-0.56%", "v":-0.56},
+        ]
+
+        gainers_defaults = [
+                {"code":"3037", "name":"欣興", "price":"248.5", "pct":"+9.98%"},
+                {"code":"2379", "name":"瑞昱", "price":"682.0", "pct":"+7.43%"},
+                {"code":"4967", "name":"十銓", "price":"145.0", "pct":"+6.62%"},
+                {"code":"3714", "name":"富采", "price":"88.2",  "pct":"+5.81%"},
+                {"code":"2迴",  "name":"正文", "price":"47.6",  "pct":"+5.07%"},
+        ]
+        losers_defaults = [
+                {"code":"1605", "name":"華新", "price":"48.9",  "pct":"-6.88%"},
+                {"code":"2474", "name":"可成", "price":"178.0", "pct":"-5.33%"},
+                {"code":"9910", "name":"豐泰", "price":"223.5", "pct":"-4.48%"},
+                {"code":"3706", "name":"神達", "price":"57.8",  "pct":"-3.92%"},
+                {"code":"2492", "name":"華新科", "price":"135.0", "pct":"-3.57%"},
+        ]
+
+        news_defaults = [
+                {"emoji":"📈", "headline":"台積電法說會後股價大漲，外資大幅調升目標價至1,350元", "time":"1小時前 · 工商時報"},
+                {"emoji":"🌐", "headline":"Fed官員暗示年內可能降息2碼，美股三大指數全面走揚", "time":"2小時前 · 經濟日報"},
+                {"emoji":"🤖", "headline":"AI伺服器需求持續旺盛，台廠供應鏈受惠訂單能見度達明年底", "time":"3小時前 · 電子時報"},
+                {"emoji":"🏦", "headline":"央行維持利率不變，總裁楊金龍：密切關注通膨與房市動向", "time":"5小時前 · 中央社"},
+                {"emoji":"🚢", "headline":"長榮海運Q2獲利優預期，市場樂觀看待下半年運費走勢", "time":"6小時前 · MoneyDJ"},
+        ]
+
+        # Attempt to enrich defaults with live quotes, but fall back gracefully
+        indices_data = []
+        for d in indices_defaults:
+                price_s = d['price']
+                chg_s = d['chg']
+                pct_s = d['pct']
+                dir_s = d['dir']
+                try:
+                        mapping = {'TWII':'^TWII','SSEC':'000001.SS','DJI':'^DJI','IXIC':'^IXIC'}
+                        tick = mapping.get(d['code'], d['code'])
+                        q = get_latest_quote_info(tick)
+                        if q and q.get('price') is not None:
+                                p = q.get('price')
+                                price_s = f"{p:,.2f}"
+                                chg_v = q.get('change')
+                                if chg_v is not None:
+                                        chg_s = f"{chg_v:+.2f}"
+                                        dir_s = 'up' if chg_v >= 0 else 'dn'
+                                prev = q.get('prev_close')
+                                if prev:
+                                        try:
+                                                pct_s = f"{((p - prev)/prev*100):+.2f}%"
+                                        except Exception:
+                                                pass
+                except Exception:
+                        pass
+                indices_data.append({ 'name': d['name'], 'code': d['code'], 'price': price_s, 'chg': chg_s, 'pct': pct_s, 'dir': dir_s })
+
+        stocks_data = []
+        for s in stocks_defaults:
+                price_s = s['price']
+                chg_s = s['chg']
+                pct_s = s['pct']
+                dir_s = s['dir']
+                try:
+                        resolved, _ = resolve_candidate_symbol(s['code'])
+                        q = get_latest_quote_info(resolved)
+                        if q and q.get('price') is not None:
+                                p = q.get('price')
+                                # Show integer if price seems to be integer-like, else two decimals
+                                try:
+                                        if abs(p - round(p)) < 0.001:
+                                                price_s = f"{int(round(p)):,}"
+                                        else:
+                                                price_s = f"{p:,.2f}"
+                                except Exception:
+                                        price_s = str(p)
+                                chg_v = q.get('change')
+                                if chg_v is not None:
+                                        chg_s = f"{chg_v:+.2f}"
+                                        dir_s = 'up' if chg_v >= 0 else 'dn'
+                                prev = q.get('prev_close')
+                                if prev:
+                                        try:
+                                                pct_s = f"{((p - prev)/prev*100):+.2f}%"
+                                        except Exception:
+                                                pass
+                except Exception:
+                        pass
+                stocks_data.append({
+                        'code': s['code'], 'name': s['name'], 'price': price_s, 'chg': chg_s, 'pct': pct_s, 'vol': s.get('vol'), 'pe': s.get('pe'), 'dir': dir_s, 'color': s.get('color')
+                })
+
+        # Use defaults for sectors/gainers/losers/news (could enrich similarly)
+        sectors_data = sectors_defaults
+        gainers_data = gainers_defaults
+        losers_data = losers_defaults
+        news_data = news_defaults
+
+        # Inline HTML template (from user's design) with placeholders
+        html_template = r"""
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>股市資訊 | FinanceHub</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700&family=IBM+Plex+Mono:wght@400;600&family=Bebas+Neue&display=swap" rel="stylesheet">
+<style>
+    :root {
+        --bg: #0d0f14;
+        --bg2: #13161e;
+        --bg3: #1a1e2a;
+        --card: #161b26;
+        --border: #232840;
+        --accent: #6c63ff;
+        --up: #00d68f;
+        --down: #ff4757;
+        --flat: #8899aa;
+        --text: #e8eaf0;
+        --muted: #7a8499;
+        --header-h: 54px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: 'Noto Sans TC', sans-serif; font-size: 14px; min-height: 100vh; }
+
+    /* ── TICKER TAPE ── */
+    .ticker-wrap { background: var(--bg3); border-bottom: 1px solid var(--border); overflow: hidden; height: 32px; display: flex; align-items: center; }
+    .ticker-track { display: flex; gap: 0; white-space: nowrap; animation: ticker 40s linear infinite; }
+    .ticker-item { padding: 0 28px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; display: flex; gap: 8px; align-items: center; border-right: 1px solid var(--border); }
+    .ticker-item .sym { color: var(--text); font-weight: 600; }
+    .ticker-item .val { color: var(--muted); }
+    .ticker-item .chg.up { color: var(--up); }
+    .ticker-item .chg.dn { color: var(--down); }
+    @keyframes ticker { 0%{transform:translateX(0)} 100%{transform:translateX(-50%)} }
+
+    /* ── HEADER ── */
+    header { height: var(--header-h); background: var(--bg2); border-bottom: 1px solid var(--border); display: flex; align-items: center; padding: 0 24px; gap: 32px; position: sticky; top: 0; z-index: 100; }
+    .logo { font-family: 'Bebas Neue', sans-serif; font-size: 26px; letter-spacing: 2px; color: var(--accent); flex-shrink: 0; }
+    .logo span { color: var(--text); }
+    nav { display: flex; gap: 4px; flex: 1; }
+    nav a { color: var(--muted); text-decoration: none; padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 500; transition: all .2s; }
+    nav a:hover, nav a.active { color: var(--text); background: var(--bg3); }
+    .search-bar { display: flex; align-items: center; background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 0 12px; gap: 8px; width: 220px; }
+    .search-bar input { background: none; border: none; outline: none; color: var(--text); font-size: 13px; width: 100%; padding: 7px 0; font-family: inherit; }
+    .search-bar input::placeholder { color: var(--muted); }
+    .search-bar svg { color: var(--muted); flex-shrink: 0; }
+
+    /* ── LAYOUT ── */
+    .page { max-width: 1280px; margin: 0 auto; padding: 24px 24px 60px; display: grid; grid-template-columns: 1fr 320px; gap: 24px; }
+    .main-col { display: flex; flex-direction: column; gap: 24px; }
+    .side-col { display: flex; flex-direction: column; gap: 20px; }
+
+    /* ── INDEX CARDS ── */
+    .index-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+    .idx-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; cursor: pointer; transition: border-color .2s, transform .15s; position: relative; overflow: hidden; }
+    .idx-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+    .idx-card .name { font-size: 12px; color: var(--muted); font-weight: 500; margin-bottom: 6px; }
+    .idx-card .price { font-family: 'IBM Plex Mono', monospace; font-size: 22px; font-weight: 600; line-height: 1; }
+    .idx-card .change { font-family: 'IBM Plex Mono', monospace; font-size: 12px; margin-top: 6px; }
+    .idx-card .sparkline { position: absolute; right: 0; bottom: 0; opacity: .35; }
+    .up { color: var(--up); } .dn { color: var(--down); }
+
+    /* ── SECTION HEADING ── */
+    .sec-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+    .sec-head h2 { font-size: 16px; font-weight: 700; }
+    .sec-head a { font-size: 12px; color: var(--accent); text-decoration: none; }
+
+    /* ── TABLE ── */
+    .stock-table { width: 100%; border-collapse: collapse; }
+    .stock-table th { text-align: left; font-size: 11px; font-weight: 600; color: var(--muted); padding: 8px 12px; border-bottom: 1px solid var(--border); text-transform: uppercase; letter-spacing: .6px; }
+    .stock-table th.r, .stock-table td.r { text-align: right; }
+    .stock-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+    .stock-table tr:last-child td { border-bottom: none; }
+    .stock-table tr:hover td { background: var(--bg3); }
+    .stock-table .mono { font-family: 'IBM Plex Mono', monospace; }
+    .sym-cell { display: flex; align-items: center; gap: 10px; }
+    .sym-ico { width: 30px; height: 30px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; flex-shrink: 0; }
+    .sym-info .sym-code { font-weight: 700; font-size: 13px; }
+    .sym-info .sym-name { font-size: 11px; color: var(--muted); }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+    .badge.up { background: rgba(0,214,143,.12); color: var(--up); }
+    .badge.dn { background: rgba(255,71,87,.12); color: var(--down); }
+
+    /* ── CHART PANEL ── */
+    .chart-panel { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+    .chart-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 16px; }
+    .chart-title h3 { font-size: 18px; font-weight: 700; }
+    .chart-title .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .chart-price { text-align: right; }
+    .chart-price .big { font-family: 'IBM Plex Mono', monospace; font-size: 28px; font-weight: 600; }
+    .chart-price .chg { font-family: 'IBM Plex Mono', monospace; font-size: 13px; margin-top: 4px; }
+    .range-tabs { display: flex; gap: 4px; margin-bottom: 12px; }
+    .range-tabs button { background: none; border: 1px solid var(--border); border-radius: 6px; color: var(--muted); font-size: 12px; padding: 4px 12px; cursor: pointer; font-family: inherit; transition: all .15s; }
+    .range-tabs button.active, .range-tabs button:hover { background: var(--accent); border-color: var(--accent); color: #fff; }
+    canvas#chart { width: 100% !important; height: 180px !important; }
+
+    /* ── MINI TABLE IN CARD ── */
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
+    .mini-list { display: flex; flex-direction: column; gap: 0; }
+    .mini-row { display: flex; align-items: center; justify-content: space-between; padding: 9px 0; border-bottom: 1px solid var(--border); }
+    .mini-row:last-child { border-bottom: none; }
+    .mini-row .left { display: flex; flex-direction: column; gap: 2px; }
+    .mini-row .left .code { font-size: 13px; font-weight: 700; }
+    .mini-row .left .name { font-size: 11px; color: var(--muted); }
+    .mini-row .right { text-align: right; }
+    .mini-row .right .price { font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; }
+    .mini-row .right .pct { font-family: 'IBM Plex Mono', monospace; font-size: 11px; margin-top: 2px; }
+
+    /* ── NEWS ── */
+    .news-list { display: flex; flex-direction: column; gap: 14px; }
+    .news-item { display: flex; gap: 12px; cursor: pointer; padding: 12px; border-radius: 10px; border: 1px solid transparent; transition: border-color .2s, background .2s; }
+    .news-item:hover { background: var(--bg3); border-color: var(--border); }
+    .news-img { width: 80px; height: 60px; border-radius: 8px; object-fit: cover; background: var(--bg3); flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 24px; }
+    .news-body .headline { font-size: 13px; font-weight: 600; line-height: 1.4; margin-bottom: 4px; }
+    .news-body .meta { font-size: 11px; color: var(--muted); }
+
+    /* ── SIDEBAR STAT ── */
+    .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .stat-item { background: var(--bg3); border-radius: 8px; padding: 10px 12px; }
+    .stat-item .label { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+    .stat-item .value { font-family: 'IBM Plex Mono', monospace; font-size: 14px; font-weight: 600; }
+
+    /* ── SECTOR HEATMAP ── */
+    .heatmap { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+    .hmap-cell { border-radius: 8px; padding: 10px 8px; text-align: center; cursor: pointer; transition: opacity .2s; }
+    .hmap-cell:hover { opacity: .8; }
+    .hmap-cell .hname { font-size: 11px; font-weight: 600; color: rgba(255,255,255,.85); }
+    .hmap-cell .hpct { font-size: 13px; font-weight: 700; color: #fff; margin-top: 3px; font-family: 'IBM Plex Mono', monospace; }
+
+    /* ── FOOTER ── */
+    footer { background: var(--bg2); border-top: 1px solid var(--border); padding: 20px 24px; text-align: center; font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<!-- Ticker Tape -->
+<div class="ticker-wrap">
+    <div class="ticker-track" id="ticker"></div>
+</div>
+
+<!-- Header -->
+<header>
+    <div class="logo">Finance<span>Hub</span></div>
+    <nav>
+        <a href="#" class="active">市場總覽</a>
+        <a href="#">個股查詢</a>
+        <a href="#">ETF</a>
+        <a href="#">期貨選擇權</a>
+        <a href="#">外匯</a>
+        <a href="#">財經新聞</a>
+        <a href="#">我的自選股</a>
+    </nav>
+    <div class="search-bar">
+        <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+        <input type="text" placeholder="搜尋股票、ETF…">
+    </div>
+</header>
+
+<!-- Main Layout -->
+<div class="page">
+    <div class="main-col">
+
+        <!-- Index Cards -->
+        <div>
+            <div class="sec-head"><h2>主要指數</h2><a href="#">查看全部 →</a></div>
+            <div class="index-row" id="idx-row"></div>
+        </div>
+
+        <!-- Chart Panel -->
+        <div class="chart-panel">
+            <div class="chart-header">
+                <div class="chart-title">
+                    <h3>台灣加權指數 <span style="font-size:13px;color:var(--muted);font-weight:400">TWII</span></h3>
+                    <div class="sub">台灣證券交易所 · 即時報價</div>
+                </div>
+                <div class="chart-price">
+                    <div class="big up" id="twii-price">22,346.80</div>
+                    <div class="chg up" id="twii-chg">▲ 184.30 (+0.83%)</div>
+                </div>
+            </div>
+            <div class="range-tabs">
+                <button>1D</button><button class="active">5D</button><button>1M</button><button>3M</button><button>1Y</button><button>5Y</button>
+            </div>
+            <canvas id="chart"></canvas>
+        </div>
+
+        <!-- Hot Stocks Table -->
+        <div>
+            <div class="sec-head"><h2>熱門個股</h2><a href="#">更多排行 →</a></div>
+            <div class="card" style="padding:0;overflow:hidden;">
+                <table class="stock-table" id="stock-table">
+                    <thead>
+                        <tr>
+                            <th>股票</th>
+                            <th class="r">成交價</th>
+                            <th class="r">漲跌</th>
+                            <th class="r">漲跌幅</th>
+                            <th class="r">成交量(張)</th>
+                            <th class="r">本益比</th>
+                        </tr>
+                    </thead>
+                    <tbody id="stock-tbody"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- News -->
+        <div>
+            <div class="sec-head"><h2>財經新聞</h2><a href="#">更多新聞 →</a></div>
+            <div class="news-list" id="news-list"></div>
+        </div>
+
+    </div>
+
+    <!-- Sidebar -->
+    <div class="side-col">
+
+        <!-- Market Stats -->
+        <div class="card">
+            <div class="sec-head" style="margin-bottom:12px"><h2>市場概況</h2></div>
+            <div class="stat-grid">
+                <div class="stat-item"><div class="label">上漲家數</div><div class="value up">647</div></div>
+                <div class="stat-item"><div class="label">下跌家數</div><div class="value dn">412</div></div>
+                <div class="stat-item"><div class="label">平盤家數</div><div class="value" style="color:var(--flat)">89</div></div>
+                <div class="stat-item"><div class="label">漲停家數</div><div class="value up">23</div></div>
+                <div class="stat-item"><div class="label">跌停家數</div><div class="value dn">5</div></div>
+                <div class="stat-item"><div class="label">成交量(億)</div><div class="value">3,842</div></div>
+            </div>
+        </div>
+
+        <!-- Sector Heatmap -->
+        <div class="card">
+            <div class="sec-head" style="margin-bottom:12px"><h2>類股表現</h2></div>
+            <div class="heatmap" id="heatmap"></div>
+        </div>
+
+        <!-- Top Gainers -->
+        <div class="card">
+            <div class="sec-head" style="margin-bottom:4px"><h2>漲幅排行</h2></div>
+            <div class="mini-list" id="gainer-list"></div>
+        </div>
+
+        <!-- Top Losers -->
+        <div class="card">
+            <div class="sec-head" style="margin-bottom:4px"><h2>跌幅排行</h2></div>
+            <div class="mini-list" id="loser-list"></div>
+        </div>
+
+    </div>
+</div>
+
+<footer>
+    © 2025 FinanceHub 財金資訊 · 資料僅供參考，不構成投資建議 · 延遲15分鐘
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+// Injected data placeholders
+const indices = __INDICES__;
+const stocks = __STOCKS__;
+const sectors = __SECTORS__;
+const gainers = __GAINERS__;
+const losers = __LOSERS__;
+const news = __NEWS__;
+
+// ── TICKER ──
+const tickerData = [
+    ...indices.map(i=>({...i,type:'idx'})),
+    ...stocks.slice(0,6).map(s=>({...s,type:'stk'}))
+];
+function buildTicker(){
+    const t = document.getElementById('ticker');
+    const html = [...tickerData,...tickerData].map(d=>`
+        <div class="ticker-item">
+            <span class="sym">${d.code}</span>
+            <span class="val">${d.price}</span>
+            <span class="chg ${d.dir}">${d.pct}</span>
+        </div>`).join('');
+    t.innerHTML = html;
+}
+
+// ── INDEX CARDS ──
+function buildIndices(){
+    const spk = (up) => {
+        const pts = Array.from({length:20},(_,i)=>50+Math.sin(i*.7)*(up?8:-8)+Math.random()*6-(up?2:4));
+        const min=Math.min(...pts),max=Math.max(...pts),h=50,w=100;
+        const px = i=>i*(w/19); const py = v=>(h-(v-min)/(max-min)*h);
+        const d = pts.map((v,i)=>`${i?'L':'M'}${px(i)},${py(v)}`).join(' ');
+        const fill = `${d} L${w},${h} L0,${h} Z`;
+        const color = up ? '#00d68f' : '#ff4757';
+        return `<svg class="sparkline" width="100" height="50"><defs>
+            <linearGradient id="g${up?'u':'d'}" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="${color}" stop-opacity=".35"/>
+                <stop offset="100%" stop-color="${color}" stop-opacity="0"/>
+            </linearGradient></defs>
+            <path d="${fill}" fill="url(#g${up?'u':'d'})"/>
+            <path d="${d}" fill="none" stroke="${color}" stroke-width="1.5"/>
+        </svg>`;
+    };
+    document.getElementById('idx-row').innerHTML = indices.map(d=>`
+        <div class="idx-card">
+            <div class="name">${d.name}</div>
+            <div class="price ${d.dir}">${d.price}</div>
+            <div class="change ${d.dir}">${d.chg} (${d.pct})</div>
+            ${spk(d.dir==='up')}
+        </div>`).join('');
+}
+
+// ── STOCK TABLE ──
+function buildTable(){
+    document.getElementById('stock-tbody').innerHTML = stocks.map(s=>`
+        <tr>
+            <td><div class="sym-cell">
+                <div class="sym-ico" style="background:${s.color}22;color:${s.color}">${String(s.code).slice(-2)}</div>
+                <div class="sym-info"><div class="sym-code">${s.code}</div><div class="sym-name">${s.name}</div></div>
+            </div></td>
+            <td class="r mono">${s.price}</td>
+            <td class="r mono ${s.dir}">${s.chg}</td>
+            <td class="r"><span class="badge ${s.dir}">${s.pct}</span></td>
+            <td class="r mono">${s.vol}</td>
+            <td class="r mono">${s.pe}</td>
+        </tr>`).join('');
+}
+
+// ── HEATMAP ──
+function buildHeatmap(){
+    document.getElementById('heatmap').innerHTML = sectors.map(s=>{
+        const v = s.v; const abs = Math.abs(v);
+        const intensity = Math.min(abs/3,1);
+        const base = v>0
+            ? `rgba(0,${Math.round(100+155*intensity)},${Math.round(80*intensity)},${.25+intensity*.55})`
+            : `rgba(${Math.round(140+115*intensity)},${Math.round(30*intensity)},${Math.round(30*intensity)},${.25+intensity*.55})`;
+        return `<div class="hmap-cell" style="background:${base}">
+            <div class="hname">${s.name}</div>
+            <div class="hpct">${s.pct}</div>
+        </div>`;
+    }).join('');
+}
+
+// ── MINI LISTS ──
+function buildMini(id, data, dir){
+    document.getElementById(id).innerHTML = data.map(d=>`
+        <div class="mini-row">
+            <div class="left"><div class="code">${d.code} ${d.name}</div><div class="name">TWD ${d.price}</div></div>
+            <div class="right"><div class="pct ${dir}">${d.pct}</div></div>
+        </div>`).join('');
+}
+
+// ── NEWS ──
+function buildNews(){
+    document.getElementById('news-list').innerHTML = news.map(n=>`
+        <div class="news-item">
+            <div class="news-img">${n.emoji}</div>
+            <div class="news-body"><div class="headline">${n.headline}</div><div class="meta">${n.time}</div></div>
+        </div>`).join('');
+}
+
+// ── CHART ──
+function buildChart(){
+    const pts = 60;
+    const base = 22000;
+    let cur = base;
+    const labels = [];
+    const data = [];
+    for(let i=0;i<pts;i++){
+        cur += (Math.random()-.46)*80;
+        data.push(+cur.toFixed(1));
+        const h = Math.floor(9+i*9/pts), m = Math.floor((i*9/pts%1)*60);
+        labels.push(`${h}:${m.toString().padStart(2,'0')}`);
+    }
+    const ctx = document.getElementById('chart').getContext('2d');
+    const grad = ctx.createLinearGradient(0,0,0,180);
+    grad.addColorStop(0,'rgba(108,99,255,.35)');
+    grad.addColorStop(1,'rgba(108,99,255,0)');
+    new Chart(ctx,{
+        type:'line',
+        data:{labels,datasets:[{data,borderColor:'#6c63ff',borderWidth:2,pointRadius:0,fill:true,backgroundColor:grad,tension:.4}]},
+        options:{
+            responsive:true, maintainAspectRatio:false,
+            plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false,
+                backgroundColor:'#1a1e2a',titleColor:'#7a8499',bodyColor:'#e8eaf0',borderColor:'#232840',borderWidth:1}},
+            scales:{
+                x:{grid:{color:'rgba(255,255,255,.04)'},ticks:{color:'#7a8499',font:{size:10},maxTicksLimit:8}},
+                y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{color:'#7a8499',font:{size:10},callback:v=>v.toLocaleString()},position:'right'}
+            }
+        }
+    });
+}
+
+// ── RANGE TABS ──
+document.addEventListener('click', function(e){
+    if(e.target && e.target.closest('.range-tabs')){
+        const btn = e.target.closest('button');
+        if(btn){
+            document.querySelectorAll('.range-tabs button').forEach(x=>x.classList.remove('active'));
+            btn.classList.add('active');
+        }
+    }
+});
+
+// ── INIT ──
+buildTicker();
+buildIndices();
+buildTable();
+buildHeatmap();
+buildMini('gainer-list', gainers, 'up');
+buildMini('loser-list', losers, 'dn');
+buildNews();
+buildChart();
+setInterval(function(){
+    const el = document.getElementById('twii-price');
+    const chgEl = document.getElementById('twii-chg');
+    if(!el) return;
+    let v = parseFloat(el.textContent.replace(',','')) || 22000;
+    v += (Math.random()-.5)*10;
+    el.textContent = v.toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2});
+    const base = 22162.5;
+    const diff = (v-base);
+    const sign = diff>=0?'+':'-';
+    const pct = Math.abs(diff/base*100).toFixed(2);
+    chgEl.textContent = `${sign==='+'?'▲':'▼'} ${Math.abs(diff).toFixed(2)} (${sign}${pct}%)`;
+    chgEl.className = `chg ${diff>=0?'up':'dn'}`;
+    el.className = `big ${diff>=0?'up':'dn'}`;
+}, 1800);
+</script>
+</body>
+</html>
+"""
+
+        # JSON-serialize with ensure_ascii=False for readable Chinese
+        try:
+                html = html_template.replace('__INDICES__', json.dumps(indices_data, ensure_ascii=False))
+                html = html.replace('__STOCKS__', json.dumps(stocks_data, ensure_ascii=False))
+                html = html.replace('__SECTORS__', json.dumps(sectors_data, ensure_ascii=False))
+                html = html.replace('__GAINERS__', json.dumps(gainers_data, ensure_ascii=False))
+                html = html.replace('__LOSERS__', json.dumps(losers_data, ensure_ascii=False))
+                html = html.replace('__NEWS__', json.dumps(news_data, ensure_ascii=False))
+        except Exception as e:
+                st.error(f"建立前端模板失敗: {e}")
+                return
+
+        # Render via Streamlit components
+        components.html(html, height=920, scrolling=True)
+
 
 
 def inject_ui_styles():
@@ -2572,6 +3149,7 @@ def main():
                     pass
             
             menu = st.radio("功能導航", [
+                "市場總覽 (新UI)",
                 "回首頁", 
                 "股票資料中心", 
                 "自選股",
@@ -2586,6 +3164,12 @@ def main():
                 st.rerun()
 
     # 頁面渲染
+    if menu == "市場總覽 (新UI)":
+        try:
+            render_market_dashboard_ui()
+        except Exception as e:
+            st.error(f"無法顯示新版市場總覽: {e}")
+        return
     if menu == "回首頁":
         st.title("🏠 系統控制中心")
         now = tz_now()
