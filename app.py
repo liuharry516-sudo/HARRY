@@ -22,6 +22,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, Text, Date
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 import logging
+import html as html_module
 
 # ==============================================================================
 # [BUGFIX] 設定日誌系統以便追蹤問題
@@ -1296,6 +1297,52 @@ def get_company_display(symbol: str) -> str:
     # 無公司名稱時只回傳代碼
     return f"{base}"
 
+
+def inject_ui_styles():
+    """注入全域 CSS，改善外觀（只注入一次）。"""
+    try:
+        if st.session_state.get('_harry_ui_styles_injected'):
+            return
+    except Exception:
+        # 在非 Streamlit 上下文（測試）忽略
+        pass
+    css = r"""
+    <style>
+    .harry-light{display:inline-block;vertical-align:middle;margin-right:8px}
+    @keyframes harry-blinker{50%{opacity:0.2}100%{opacity:1}}
+    .harry-price-box{display:flex;align-items:center}
+    .harry-price-value{font-size:34px;font-weight:700;padding:8px 14px;border-radius:8px;min-width:160px;text-align:center}
+    .harry-orderbook table{width:100%;border-collapse:collapse}
+    .harry-orderbook th, .harry-orderbook td{padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.03);text-align:center}
+    </style>
+    """
+    try:
+        st.markdown(css, unsafe_allow_html=True)
+        st.session_state['_harry_ui_styles_injected'] = True
+    except Exception:
+        pass
+
+
+def estimate_orderbook(symbol: str, price: float, vol: int = None) -> pd.DataFrame:
+    """用簡易估算產生五檔報價（若無真實五檔資料，作為視覺化展示）。
+    這會以價格的千分比作為價差步伐，數量基於成交量做相對分配。
+    """
+    try:
+        if price is None:
+            return pd.DataFrame()
+        base_vol = int(vol or 100000)
+        step = max(0.01, round(price * 0.002, 4))
+        rows = []
+        for i in range(5, 0, -1):
+            p_bid = round(price - step * i, 2)
+            p_ask = round(price + step * i, 2)
+            size = max(1, int(base_vol / (i + 1)))
+            rows.append({'Bid Price': p_bid, 'Bid Size': size, 'Ask Price': p_ask, 'Ask Size': size})
+        df = pd.DataFrame(rows)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
 def compute_macd(series: pd.Series, short=12, long=26, signal=9):
     ema_short = series.ewm(span=short, adjust=False).mean()
     ema_long = series.ewm(span=long, adjust=False).mean()
@@ -1440,7 +1487,38 @@ def try_fetch_three_major_flow(symbol: str, days: int = 10):
         except Exception:
             continue
 
-    return pd.DataFrame(), '未能從 Yahoo 自動取得三大法人買賣超表格'
+    # 若 Yahoo 抓不到，使用 TWSE API 逐日備援抓取
+    try:
+        today = tz_now().date()
+        rows = []
+        for d in range(days):
+            date = (today - datetime.timedelta(days=d)).strftime('%Y%m%d')
+            try:
+                j = fetch_twse_three_major(date)
+            except Exception:
+                j = {}
+            data = j.get('data') or j.get('aaData') or []
+            fields = j.get('fields') or j.get('title')
+            for r in data:
+                try:
+                    if isinstance(r, list) and any(str(base) in str(c) for c in r):
+                        if fields and len(fields) == len(r):
+                            rows.append(dict(zip(fields, r)))
+                        else:
+                            rows.append({'date': date, 'raw': r})
+                    elif isinstance(r, dict) and any(str(base) in str(v) for v in r.values()):
+                        row = r.copy()
+                        row['date'] = date
+                        rows.append(row)
+                except Exception:
+                    continue
+        if rows:
+            df = pd.DataFrame(rows)
+            return df, '從 TWSE API 擷取到法人買賣超（備援）'
+    except Exception:
+        pass
+
+    return pd.DataFrame(), '未能從 Yahoo 或 TWSE 自動取得三大法人買賣超表格'
 
 def fetch_financials_via_web(symbol: str):
     """嘗試從 Yahoo Finance 網頁抓取財務報表表格（損益表、資產負債表、現金流量表）。
@@ -1551,6 +1629,38 @@ def fetch_financials_via_web(symbol: str):
                 r = requests.get(url, timeout=10, headers=headers)
                 r.raise_for_status()
                 html = r.text
+                # 嘗試用 meta/title 長得更穩定地抽出公司名稱與簡介（加強版）
+                if not results.get('company_name'):
+                    m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+                    if not m:
+                        m = re.search(r'<title[^>]*>(.*?)</title>', html, re.S | re.I)
+                    if m:
+                        title = html_module.unescape(re.sub(r'<.*?>', '', m.group(1))).strip()
+                        if title:
+                            results['company_name'] = title
+
+                if not results.get('summary'):
+                    m = re.search(r'<meta[^>]+property=["\']og:description["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+                    if not m:
+                        m = re.search(r'<meta[^>]+name=["\']description["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+                    if m:
+                        results['summary'] = html_module.unescape(m.group(1)).strip()
+
+                # 嘗試在原始 HTML 裡直接抽出 longBusinessSummary 的 JSON 字串（若存在）
+                if not results.get('summary'):
+                    m2 = re.search(r'"longBusinessSummary"\s*:\s*"(.*?)"', html, re.S)
+                    if m2:
+                        try:
+                            raw = m2.group(1)
+                            # 使用 json.loads 解 escape
+                            summary = json.loads('"' + raw.replace('"', '\\"') + '"')
+                            results['summary'] = html_module.unescape(summary)
+                        except Exception:
+                            try:
+                                results['summary'] = html_module.unescape(raw)
+                            except Exception:
+                                pass
+
                 # 先嘗試從 JSON store 抽取表格資料
                 if not page_store:
                     store = _extract_json_store(html)
@@ -1987,10 +2097,13 @@ def render_financial_wall(symbol):
                             balance = res['balance']
                         if not res.get('cashflow', pd.DataFrame()).empty:
                             cashflow = res['cashflow']
-                        # 若網頁取得到公司名稱，補回 info
+                        # 若網頁取得到公司名稱或 summary，補回 info
                         if res.get('company_name') and (not info or not info.get('shortName')):
                             info = info or {}
                             info['shortName'] = res.get('company_name')
+                        if res.get('summary') and (not info or not info.get('longBusinessSummary')):
+                            info = info or {}
+                            info['longBusinessSummary'] = res.get('summary')
                         # 若有任何表格則視為成功並停止
                         if (not financials.empty) or (not balance.empty) or (not cashflow.empty):
                             symbol = cand
@@ -2119,6 +2232,12 @@ def render_financial_wall(symbol):
             sign = '+' if q_pct > 0 else ('' if q_pct == 0 else '')
             pct_display = f"<div style='font-size:16px;font-weight:600;color:{pct_color};margin-left:8px'>{sign}{q_pct:.2f}%</div>"
 
+        # 注入前端樣式（只會注入一次）
+        try:
+            inject_ui_styles()
+        except Exception:
+            pass
+
         price_html = f"""
         <div style='display:flex;align-items:center;gap:12px'>
           <div style='display:flex;align-items:center'>
@@ -2132,6 +2251,20 @@ def render_financial_wall(symbol):
         </div>
         """
         st.markdown(price_html, unsafe_allow_html=True)
+
+        # 五檔報價（估算或真實資料備援）
+        try:
+            show_ob = st.checkbox("顯示五檔報價", key=f"show_ob_{symbol}")
+            if show_ob:
+                ob_df = estimate_orderbook(symbol, q_price, q_vol)
+                if not ob_df.empty:
+                    with st.container():
+                        st.markdown("**五檔報價（估算）**")
+                        st.table(ob_df)
+                else:
+                    st.info("無法提供五檔報價（沒有可用資料）")
+        except Exception:
+            pass
 
     with c_b:
         if q_change is None:
